@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "merge-gate"
+version = "0.1.0"
+description = "Auto-merge bot PRs across a fleet of repos only when a computation proves the diff safe: allowlisted shape, patch/minor delta, green required check — merged at the judged head, never armed."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "GPL-3.0-or-later"
+authors = [{ name = "gr8monk3ys" }]
+dependencies = []
+
+[project.optional-dependencies]
+yaml = ["pyyaml>=6"]
+dev = ["pytest>=8", "pyyaml>=6"]
+
+[tool.setuptools]
+# Flat layout with several top-level scripts; auto-discovery would refuse it.
+# verify-gates.py is a script, not a module, and is not installed.
+py-modules = ["classify_pr", "merge_gate", "ci_watchdog"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
