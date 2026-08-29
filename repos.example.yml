@@ -1,0 +1,12 @@
+# Optional operator config, read from ./repos.yml if present.
+#
+# The gate reads exactly one thing from it: `data_dir`, the paths a repo has
+# explicitly opted into as regenerated artifacts (scraper output, rendered
+# data). A PR that touches nothing outside those paths classifies as
+# `data-artifact-only` and may auto-merge. Absence means DENY -- an unset
+# field can never yield that shape.
+#
+# Keys are bare repo names (no owner); ownership comes from GATE_OWNERS.
+repos:
+  my-scraper:
+    data_dir: ["data", "output"]
