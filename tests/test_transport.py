@@ -11,6 +11,8 @@ against real GitHub -- is an operator check and stays out of CI: it needs a
 credential and a fleet, neither of which CI has.
 """
 
+import json
+
 import gh_transport
 import pytest
 
@@ -43,3 +45,25 @@ def test_run_honours_forced_rest_mode(monkeypatch):
                         lambda: pytest.fail("binary consulted in rest mode"))
     monkeypatch.setattr(gh_transport, "rest_run", lambda argv: "sentinel")
     assert gh_transport.run(["gh", "api", "user"]) == "sentinel"
+
+
+def test_pr_list_applies_its_jq_filter(monkeypatch):
+    """`--jq` on `pr list` is a filter, and dropping it is worse than failing.
+
+    `gh pr list --json number --jq .[].number` yields one number per line, and
+    verify-gates.py indexes into those lines to build an API path. Returning
+    the raw array instead produced
+    `/repos/o/r/pulls/[{"number": 98}, ...]` -- a wrong answer shaped exactly
+    like a right one. `repo list` always honoured the flag; `pr list` did not.
+    """
+    monkeypatch.setattr(gh_transport, "_get_all",
+                        lambda path, stop_after=None: [{"number": 98},
+                                                       {"number": 97}])
+    r = gh_transport._cmd_pr_list(
+        ["--repo", "o/r", "--state", "all", "--limit", "3",
+         "--json", "number", "--jq", ".[].number"])
+    assert r.stdout == "98\n97\n"
+
+    # Without --jq the raw projection is still the right answer.
+    r = gh_transport._cmd_pr_list(["--repo", "o/r", "--json", "number"])
+    assert json.loads(r.stdout) == [{"number": 98}, {"number": 97}]

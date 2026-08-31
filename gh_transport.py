@@ -387,6 +387,15 @@ def _cmd_pr_list(args):
     state = _flag(args, "--state") or "open"
     limit = int(_flag(args, "--limit") or 30)
     fields = (_flag(args, "--json") or "number").split(",")
+    # `--jq`/`-q` is a FILTER, not a formatting nicety: `gh pr list --json
+    # number --jq .[].number` yields one number per line and callers index
+    # into it. Dropping the filter and returning the raw array handed back
+    # `[{"number": 98}, ...]`, which then went into an API path -- a wrong
+    # answer shaped exactly like a right one, which is the single thing this
+    # module promises not to produce. _cmd_repo_list always honoured it; this
+    # one did not, and the only caller issuing this form is verify-gates.py,
+    # which is why nothing else noticed.
+    jq_expr = _flag(args, "--jq") or _flag(args, "-q")
     unknown = [f for f in fields if f not in _PR_FIELDS]
     if unknown:
         raise Unsupported(f"pr list --json fields not modelled: {unknown}")
@@ -397,6 +406,8 @@ def _cmd_pr_list(args):
         raise Unsupported(f"pr list --state {state} is not modelled")
     rows = _get_all(f"repos/{repo}/pulls?state={state}", stop_after=limit)[:limit]
     out = [{f: _PR_FIELDS[f](p) for f in fields} for p in rows]
+    if jq_expr:
+        return Result(0, render(jq(jq_expr, out)))
     return Result(0, json.dumps(out, sort_keys=True) + "\n")
 
 
@@ -744,6 +755,12 @@ def difftest():
                        "/required_status_checks", "--jq", ".contexts"], True),
         (["gh", "api", f"repos/{repo}/pulls?state=open&per_page=1",
           "--jq", '.[0] // empty | "\\(.number) \\(.head.sha)"'], True),
+        # `pr list` with a --jq filter. Added after the REST side returned the
+        # raw array here and a caller spliced it into an API path; a form that
+        # only one script issues is exactly the one no differential test
+        # covers until it breaks.
+        (["gh", "pr", "list", "--repo", repo, "--state", "all",
+          "--limit", "3", "--json", "number", "--jq", ".[].number"], True),
     ]
     bad = 0
     for argv, ordered in forms:
