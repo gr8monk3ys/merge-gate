@@ -20,9 +20,14 @@ import fnmatch
 import json
 import os
 import re
-import subprocess
 import sys
 import time
+
+# Installed as a top-level module beside this one. Every gh call in the
+# package goes through it, so an environment with no usable `gh` binary --
+# a cloud runner, a container -- still gets a real answer instead of a
+# sweep that silently examined nothing. See gh_transport.__doc__.
+import gh_transport
 
 # Every account the fleet owns code under, from GATE_OWNERS="user,org,...".
 #
@@ -389,7 +394,7 @@ def ci_fix_allowed(diff_text):
 
 
 def gh_json(*args):
-    r = subprocess.run(["gh", *args], capture_output=True, text=True)
+    r = _run_gh(["gh", *args])
     if r.returncode != 0:
         return None
     return json.loads(r.stdout) if r.stdout.strip() else None
@@ -460,7 +465,7 @@ _TRANSIENT = ("connection reset", "read tcp", "timeout", "eof",
 
 
 def _run_gh(argv, retries=4):
-    """subprocess.run for gh, retrying transient network/rate failures.
+    """One gh call, retrying transient network/rate failures.
 
     all_repos() deliberately RAISES rather than returning a partial fleet, so
     a single reset TCP connection would otherwise abort a whole sweep. The
@@ -468,7 +473,7 @@ def _run_gh(argv, retries=4):
     """
     delay = 2.0
     for attempt in range(retries + 1):
-        r = subprocess.run(argv, capture_output=True, text=True)
+        r = gh_transport.run(argv)
         if r.returncode == 0:
             return r
         if attempt < retries and any(s in (r.stderr or "").lower()
@@ -565,10 +570,9 @@ def repo_visibility():
     """
     vis = {}
     for owner in OWNERS:
-        r = subprocess.run(
+        r = _run_gh(
             ["gh", "repo", "list", owner, "--limit", "500", "--no-archived",
-             "--json", "nameWithOwner,visibility"],
-            capture_output=True, text=True)
+             "--json", "nameWithOwner,visibility"])
         if r.returncode != 0:
             continue
         vis.update({x["nameWithOwner"]: x["visibility"]
@@ -578,9 +582,8 @@ def repo_visibility():
 
 def _search_total(query):
     """Ground-truth open-PR count from the Search API's own total_count."""
-    r = subprocess.run(
-        ["gh", "api", f"search/issues?q={query}&per_page=1", "--jq", ".total_count"],
-        capture_output=True, text=True)
+    r = _run_gh(
+        ["gh", "api", f"search/issues?q={query}&per_page=1", "--jq", ".total_count"])
     if r.returncode != 0:
         return None
     try:
@@ -675,10 +678,9 @@ def changed_paths(repo, number):
     # NOT --jq '[.[].filename]': with --paginate that emits one JSON array PER
     # PAGE, and the concatenation is not valid JSON. Emit one filename per line
     # and split, which paginates cleanly for PRs of any size.
-    r = subprocess.run(
+    r = _run_gh(
         ["gh", "api", f"repos/{repo}/pulls/{number}/files",
-         "--paginate", "--jq", ".[].filename"],
-        capture_output=True, text=True)
+         "--paginate", "--jq", ".[].filename"])
     if r.returncode != 0:
         return None
     return [l.strip() for l in r.stdout.splitlines() if l.strip()]
