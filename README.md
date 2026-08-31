@@ -81,6 +81,7 @@ repo)* / *no verdict (GitHub did not answer — retry, not a finding)*.
 | `DRY_RUN` | `1` | `0` to merge and label. |
 | `INCLUDE_BOTS` | `1` | `0` to ignore Dependabot. Bots are roughly four fifths of a real queue; leaving them out is how a full queue reports as empty. |
 | `ONLY_PUBLIC` | unset | `1` to skip private repos — for GitHub's capped private-repo Actions minutes, not for safety. |
+| `GATE_REPOS_YML` | `./repos.yml` | Path to the optional `repos.yml`. Absolute is safest — installed as a package there is no "next to the source file". |
 | `GH_TRANSPORT` | `auto` | `gh` forces the binary, `rest` forces the REST API. `auto` uses the binary only when it can actually authenticate. |
 
 ## The tools
@@ -93,7 +94,9 @@ repo)* / *no verdict (GitHub did not answer — retry, not a finding)*.
 | `verify-gates.py` | Does every *required* check actually fire on pull requests? A required check that only runs on push never goes green on a PR, so nothing can ever merge. (A script, not an importable module — it is not installed.) |
 | `gh_transport.py` | Can this environment reach GitHub at all, and by which route? `--whoami` answers; `--difftest` proves the two routes agree. |
 
-Optional: `repos.yml` (see `repos.example.yml`) declares `data_dir` opt-ins.
+Optional: `repos.yml` (see `repos.example.yml`) declares `data_dir` opt-ins;
+it is looked for at `GATE_REPOS_YML`, else `repos.yml` in the working
+directory.
 Nothing else is configuration; the policy is three constants at the top of
 `classify_pr.py`, and changing what merges is a one-line, deliberate edit.
 

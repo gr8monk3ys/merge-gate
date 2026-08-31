@@ -400,11 +400,31 @@ def gh_json(*args):
     return json.loads(r.stdout) if r.stdout.strip() else None
 
 
-REPOS_YML = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..",
-                         "repos.yml")
+def repos_yml_path():
+    """Where the operator's repos.yml lives.
+
+    This used to be `<this file>/../repos.yml`, which is right for a script
+    sitting in a control plane's `scripts/` directory and meaningless for an
+    installed package: site-packages/../repos.yml does not exist and never
+    will. The failure was quiet in the direction that matters --
+    load_data_dirs() swallows a missing file and returns {}, so every
+    `data_dir` opt-in would silently stop counting and `data-artifact-only`
+    would stop matching, with no error anywhere.
+
+    So: explicit via GATE_REPOS_YML, else `repos.yml` in the working
+    directory, which is the control-plane checkout the gate is run from.
+    Resolved per call, not once at import, so a caller can set it late.
+    """
+    return os.environ.get("GATE_REPOS_YML") or os.path.join(os.getcwd(),
+                                                            "repos.yml")
 
 
-def parse_repos_yml(path=REPOS_YML):
+# Back-compat name; prefer repos_yml_path(), which honours a late
+# GATE_REPOS_YML. Kept because it reads clearly in error messages.
+REPOS_YML = repos_yml_path()
+
+
+def parse_repos_yml(path=None):
     """repos.yml's `repos:` block as {key: {loops, paused, base, status, data_dir}}.
 
     A real YAML load, not a regex sweep. The regex version this replaces was
@@ -424,6 +444,7 @@ def parse_repos_yml(path=REPOS_YML):
     says must never receive a guess. load_data_dirs() below deliberately
     softens that for consumers who only want an optional enrichment.
     """
+    path = path or repos_yml_path()
     try:
         import yaml
     except ImportError:
