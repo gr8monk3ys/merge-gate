@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "merge-gate"
-version = "0.1.0"
+version = "0.2.0"
 description = "Auto-merge bot PRs across a fleet of repos only when a computation proves the diff safe: allowlisted shape, patch/minor delta, green required check — merged at the judged head, never armed."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -16,10 +16,23 @@ dependencies = []
 yaml = ["pyyaml>=6"]
 dev = ["pytest>=8", "pyyaml>=6"]
 
+[project.scripts]
+# The gate is run by scheduled jobs, not by hand, and a console script is the
+# only entry point that survives being installed somewhere other than the
+# checkout it was written in. `main()` returns the exit code in all three;
+# ci-watchdog deliberately exits 1 when a required check is red at HEAD.
+merge-gate = "merge_gate:main"
+ci-watchdog = "ci_watchdog:main"
+classify-pr = "classify_pr:main"
+
+[project.urls]
+Homepage = "https://github.com/gr8monk3ys/merge-gate"
+
 [tool.setuptools]
 # Flat layout with several top-level scripts; auto-discovery would refuse it.
-# verify-gates.py is a script, not a module, and is not installed.
-py-modules = ["classify_pr", "merge_gate", "ci_watchdog"]
+# verify-gates.py is a script, not a module, and is not installed -- it is a
+# one-shot operator check, not something another module imports.
+py-modules = ["classify_pr", "merge_gate", "ci_watchdog", "gh_transport"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
