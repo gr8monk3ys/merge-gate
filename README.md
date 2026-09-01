@@ -49,16 +49,27 @@ diff vetoes — "I could not check" never resolves to "there is nothing there".
 - Never reports a drained queue it did not fully enumerate. Search endpoints
   cap silently; it lists per repo and cross-checks the total.
 
-## Quickstart
-
-Needs Python ≥ 3.11 and an authenticated [`gh`](https://cli.github.com/).
+## Install
 
 ```sh
-gh auth status
+pip install "merge-gate @ git+https://github.com/gr8monk3ys/merge-gate@v0.2.0"
+```
+
+That puts three console scripts on `PATH` — `merge-gate`, `ci-watchdog`,
+`classify-pr` — so the gate runs from anywhere, not only from a checkout.
+Running the files directly still works and is equivalent.
+
+## Quickstart
+
+Needs Python ≥ 3.11. An authenticated [`gh`](https://cli.github.com/) is used
+when it is present and working; when it is not, the same calls go over the
+REST API instead (see *Transport* below), so no binary is strictly required.
+
+```sh
 export GATE_OWNERS="you,your-org"      # every account the fleet lives under
 
-python3 merge_gate.py                  # report only — the default
-DRY_RUN=0 python3 merge_gate.py        # merge judged heads, label the rest
+merge-gate                             # report only — the default
+DRY_RUN=0 merge-gate                   # merge judged heads, label the rest
 ```
 
 The report separates *would merge* / *routed to review* / *skipped (ungated
@@ -70,6 +81,8 @@ repo)* / *no verdict (GitHub did not answer — retry, not a finding)*.
 | `DRY_RUN` | `1` | `0` to merge and label. |
 | `INCLUDE_BOTS` | `1` | `0` to ignore Dependabot. Bots are roughly four fifths of a real queue; leaving them out is how a full queue reports as empty. |
 | `ONLY_PUBLIC` | unset | `1` to skip private repos — for GitHub's capped private-repo Actions minutes, not for safety. |
+| `GATE_REPOS_YML` | `./repos.yml` | Path to the optional `repos.yml`. Absolute is safest — installed as a package there is no "next to the source file". |
+| `GH_TRANSPORT` | `auto` | `gh` forces the binary, `rest` forces the REST API. `auto` uses the binary only when it can actually authenticate. |
 
 ## The tools
 
@@ -78,11 +91,42 @@ repo)* / *no verdict (GitHub did not answer — retry, not a finding)*.
 | `classify_pr.py` | What shape is each open PR, and would it merge? Pure classifier; `--validate` runs the self-tests plus any live fixtures you add. |
 | `merge_gate.py` | Merge what earns it, at its judged head. Label the rest `needs-review`. |
 | `ci_watchdog.py` | Is each repo's **default branch** still green — and since when? A red default branch blocks every merge in that repo and looks identical, from outside, to a repo with nothing to do. One repo sat that way for 37 days holding 15 mergeable PRs. |
-| `verify-gates.py` | Does every *required* check actually fire on pull requests? A required check that only runs on push never goes green on a PR, so nothing can ever merge. |
+| `verify-gates.py` | Does every *required* check actually fire on pull requests? A required check that only runs on push never goes green on a PR, so nothing can ever merge. (A script, not an importable module — it is not installed.) |
+| `gh_transport.py` | Can this environment reach GitHub at all, and by which route? `--whoami` answers; `--difftest` proves the two routes agree. |
 
-Optional: `repos.yml` (see `repos.example.yml`) declares `data_dir` opt-ins.
+Optional: `repos.yml` (see `repos.example.yml`) declares `data_dir` opt-ins;
+it is looked for at `GATE_REPOS_YML`, else `repos.yml` in the working
+directory.
 Nothing else is configuration; the policy is three constants at the top of
 `classify_pr.py`, and changing what merges is a one-line, deliberate edit.
+
+## Transport: the gate must run where `gh` does not
+
+A scheduled runner executed the gate 15+ times over three weeks, reported
+*"GitHub access is not enabled for this session"* each time, and skipped.
+Every script shells out to `gh`, so the gate had not declined to arm anything
+— it had never run, and each "queue drained" was a report about a sweep that
+did not happen.
+
+`gh_transport.run(argv)` takes the same `gh` argv the scripts already build
+and issues it against the REST API when the binary cannot authenticate. Call
+sites are unchanged, deliberately: those argv strings encode detail that is
+easy to lose by hand (`--paginate` with a line-per-record jq,
+`--match-head-commit`, gh's uppercase `visibility`). Credentials come from
+`GH_TOKEN`/`GITHUB_TOKEN`, then `gh auth token`, then `git credential fill` —
+the last being the same question git asks before a push, so in a runner that
+can push, this can read.
+
+**Only the argv forms this package issues are modelled. An unmodelled form
+exits nonzero rather than approximating** — every caller already reads that as
+"GitHub did not answer" and fails safe, whereas a plausible wrong answer would
+be filed as a fact about a pull request.
+
+```sh
+python3 gh_transport.py            # jq-subset selftest, no network
+python3 gh_transport.py --whoami   # which transport, is there a credential
+DIFFTEST_REPO=you/repo python3 gh_transport.py --difftest   # both routes, live
+```
 
 ## Tests
 
@@ -92,6 +136,10 @@ pytest                          # pure: no network, no gh
 python3 classify_pr.py --validate
 ```
 
+`--difftest` is deliberately **not** in CI: it needs a credential and a real
+fleet to compare against. It is the operator's check, run before trusting the
+REST route.
+
 The tests are the policy written as statements — *a group is as risky as its
 worst member*, *the sentence period is not part of the version*, *only
 "dirty" is a conflict verdict*. Read `tests/test_policy.py` as the spec.
@@ -99,8 +147,9 @@ worst member*, *the sentence period is not part of the version*, *only
 ## Provenance
 
 Extracted on 2026-08-28 from the private control plane that runs it on a
-schedule. The numbers in the comments are real; the repos named are the
-author's. The private copy is vendored, so the two can diverge — `diff` is the
-sync check until the control plane consumes this package directly.
+schedule. The numbers in the comments are real. The control plane vendored a
+copy for a month and the two drifted; as of 0.2.0 it installs this package as
+a dependency instead, which is why the entry points and the transport live
+here rather than there.
 
 GPL-3.0-or-later.

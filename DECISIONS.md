@@ -341,18 +341,96 @@ is a false positive that shipped:
 
 ---
 
-## VI. What was deliberately not done
+## VI. Reaching GitHub at all
 
-- **The private control plane still vendors these files** rather than
-  consuming this repo as a package. Its scheduled agents run
-  `scripts/merge_gate.py` from their own checkout, and repointing them is a
-  change that can only be verified by running a cloud routine. Until then
-  the two copies are kept in sync by `diff`, and the only intended
-  differences are: owners from `GATE_OWNERS` instead of a constant, an empty
-  live-fixture list, and two anonymised repo names.
+### 26. The gate must run where there is no usable `gh` binary.
+
+Every script here shells out to `gh`. A scheduled runner operating this policy
+could not authenticate it, and for three weeks reported *"GitHub access is not
+enabled for this session"* on 15+ consecutive runs and skipped. The gate had
+not declined to arm anything — it never executed, and every report of a
+drained queue described a sweep that had not happened. Producing loops
+meanwhile throttled themselves correctly against a PR cap only the gate could
+relieve.
+
+That runner was not cut off from GitHub: it pushed commits on every run, so a
+credential was reachable, just not through `gh`. `gh_transport.run(argv)` takes
+the same argv the scripts already build and issues it over REST when the binary
+cannot answer. Credentials come from `GH_TOKEN`/`GITHUB_TOKEN`, then
+`gh auth token`, then `git credential fill` — the last being the same question
+git asks before a push, so *if the push works, the reads work*.
+
+Call sites are unchanged deliberately. Those argv strings encode detail that is
+easy to lose by hand: `--paginate` with a line-per-record jq (§23),
+`--match-head-commit` (§14), gh's uppercase `visibility`. Routing them beats
+rewriting them.
+
+### 27. An unmodelled argv form fails. It does not approximate — and once it did.
+
+Only the forms this package issues are modelled. Anything else returns a
+nonzero code, because every caller already reads that as "GitHub did not
+answer" and fails safe (§22). A plausible wrong answer would instead be filed
+as a fact about a pull request.
+
+`_cmd_pr_list` broke that promise from the day it was written. It parsed
+`--jq`'s neighbours and then ignored the flag, returning the raw projection
+where `gh` yields one value per line:
+
+    URL can't contain control characters.
+    '/repos/o/r/pulls/[{"number": 98}, {"number": 97}]'
+
+The caller had spliced the array into an API path. A crash was the *lucky*
+outcome: the same value reaching a script that samples PRs before writing
+branch protection yields "no PRs to sample" and silently under-enforces the
+gate it was run to enforce.
+
+`_cmd_api` and `_cmd_repo_list` had always honoured `--jq`; `pr list` was the
+gap. Nothing in this package issues that form — only two scripts in the
+consuming control plane do — which is exactly why an eight-form differential
+test never covered it. **The form only one or two callers issue is the one the
+differential test will not cover until it breaks.** It is form #9 now, plus a
+pure regression test that needs no network.
+
+Two `gh` behaviours are matched deliberately, because the differential test is
+worthless without them: gojq sorts object keys where CPython's `json`
+preserves insertion order, and `gh repo list` omits `disabled` repos — letting
+one through would add a repo to the sweep that can only ever 403, the same
+reason archived repos are excluded (§18).
+
+### 28. `repos.yml` is not "next to the source file".
+
+`REPOS_YML` was `<this file>/../repos.yml`. Correct for a script sitting in a
+control plane's `scripts/` directory, meaningless once installed, where it
+resolves to `site-packages/../repos.yml` and never exists.
+
+It failed quietly in the direction that matters. `load_data_dirs()` swallows a
+missing file and returns `{}` on purpose (§5: absence means deny), so every
+`data_dir` opt-in would silently stop counting and `data-artifact-only` would
+silently stop matching, with nothing in any report saying so. Only
+`parse_repos_yml()` — deliberately strict — failed loudly, and that is how it
+was found, on the first fresh-venv run of a consumer.
+
+`GATE_REPOS_YML`, else `repos.yml` in the working directory, **resolved per
+call** rather than bound at import, so a consumer can point at its own file
+after importing the package. An absolute path is the safe form: the working
+directory is right for an operator standing in their checkout and wrong for a
+loop that `cd`'d into a clone it was fixing.
+
+---
+
+## VII. What was deliberately not done
+
+- **The private control plane vendored these files until 2026-08-31.** The
+  two copies were "kept in sync by `diff`", and nobody ran the diff:
+  `classify_pr.py` had drifted 127 lines, and the transport in §26 existed
+  only in an unmerged PR *there*. None of the drift was policy — it was owner
+  wiring, cross-references and usage strings — which is the argument for a
+  dependency rather than for better discipline. It consumes this package now,
+  and both bugs in §27 and §28 were found by that consumer's first
+  fresh-venv run, having been invisible for as long as the caller stood in a
+  checkout with a working `gh`.
 - **The live fixtures are empty here.** They ran against the author's PRs
-  and belong to whoever operates the gate. The pure self-tests (36 cases)
-  always run.
+  and belong to whoever operates the gate. The pure self-tests always run.
 - **No branch protection on this repository.** It is single-author; the CI
   check is evidence, not a gate.
 - **The two policy constants stay strict** (see §9).

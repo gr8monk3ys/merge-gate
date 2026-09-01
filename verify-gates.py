@@ -12,17 +12,19 @@ confirms that against real PR head commits.
 """
 
 import json
-import subprocess
 import sys
 
 import os
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from classify_pr import require_owners  # noqa: E402
+from classify_pr import require_owners, _run_gh  # noqa: E402
 
 
 def gh(*args):
-    r = subprocess.run(["gh", *args], capture_output=True, text=True)
+    # Through the shared transport, so this runs where there is no `gh`
+    # binary -- otherwise every other gate script works in the cloud runner
+    # and this one silently would not.
+    r = _run_gh(["gh", *args])
     return (r.stdout.strip() if r.returncode == 0 else None)
 
 

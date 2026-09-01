@@ -209,3 +209,44 @@ def test_owners_come_from_env_and_an_empty_fleet_is_refused(monkeypatch):
     finally:
         monkeypatch.delenv("GATE_OWNERS", raising=False)
         importlib.reload(cp)
+
+
+# ---------------------------------------------------------------------------
+# repos.yml resolution
+#
+# This is policy input, not plumbing: `data_dir` opt-ins are the only thing
+# that makes `data-artifact-only` match anything, and load_data_dirs()
+# swallows a missing file. Resolve the path wrong and the shape quietly stops
+# matching, with nothing in any report to say so. It resolved wrong for every
+# installed copy of this package until 0.2.0.
+
+
+def test_repos_yml_is_explicit_then_cwd(tmp_path, monkeypatch):
+    monkeypatch.delenv("GATE_REPOS_YML", raising=False)
+    monkeypatch.chdir(tmp_path)
+    assert cp.repos_yml_path() == str(tmp_path / "repos.yml")
+
+    monkeypatch.setenv("GATE_REPOS_YML", "/somewhere/else/repos.yml")
+    assert cp.repos_yml_path() == "/somewhere/else/repos.yml"
+
+
+def test_repos_yml_env_is_read_per_call_not_at_import(tmp_path, monkeypatch):
+    """Set late, honoured anyway.
+
+    A consumer that binds the package's config after importing it -- which is
+    what a control plane's own shim does -- would otherwise get the value
+    frozen at import time and never know.
+    """
+    f = tmp_path / "repos.yml"
+    f.write_text("repos:\n  demo: {loops: [x], data_dir: [data/]}\n")
+    monkeypatch.setenv("GATE_REPOS_YML", str(f))
+    assert cp.parse_repos_yml()["demo"]["data_dir"] == ["data/"]
+    assert cp.load_data_dirs() == {"demo": ["data/"]}
+
+
+def test_missing_repos_yml_degrades_only_for_data_dirs(tmp_path, monkeypatch):
+    """parse_repos_yml raises; load_data_dirs returns {}. Both deliberate."""
+    monkeypatch.setenv("GATE_REPOS_YML", str(tmp_path / "nope.yml"))
+    with pytest.raises(OSError):
+        cp.parse_repos_yml()
+    assert cp.load_data_dirs() == {}
