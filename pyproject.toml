@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "merge-gate"
-version = "0.2.0"
+version = "0.3.0"
 description = "Auto-merge bot PRs across a fleet of repos only when a computation proves the diff safe: allowlisted shape, patch/minor delta, green required check — merged at the judged head, never armed."
 readme = "README.md"
 requires-python = ">=3.11"

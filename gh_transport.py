@@ -751,6 +751,11 @@ def difftest():
           "--jq", "[.check_runs[]|{name,conclusion}]"], True),
         (["gh", "api", f"repos/{repo}/branches/{branch}/protection"
                        "/required_status_checks", "--jq", ".contexts"], True),
+        # The base-freshness read (merge_gate.base_head). Its answer is
+        # compared byte-for-byte to pulls.base.sha, so a transport that
+        # rendered it with a trailing quote would stale every PR in the fleet.
+        (["gh", "api", f"repos/{repo}/branches/{branch}",
+          "--jq", ".commit.sha"], True),
         (["gh", "api", f"repos/{repo}/branches/no-such-branch/protection"
                        "/required_status_checks", "--jq", ".contexts"], True),
         (["gh", "api", f"repos/{repo}/pulls?state=open&per_page=1",

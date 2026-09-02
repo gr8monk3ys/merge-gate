@@ -418,7 +418,59 @@ loop that `cd`'d into a clone it was fixing.
 
 ---
 
-## VII. What was deliberately not done
+## VII. What "green" was measured against
+
+### 29. Green against which base? One merge per base branch per sweep; the rest are stale.
+
+On 2026-09-02 the gate swept `finance-owl` and merged four PRs in 21 seconds:
+`#148` (00:19:52, sentry ^10.72.0 into `packages/backend/package.json`),
+`#147`, `#146`, and `#145` (00:20:13) — a lockfile-only PR whose
+`pnpm-lock.yaml` still resolved sentry at ^10.70.0. Every one of the four
+carried `base.sha = 71a7a3cf`, the `main` that existed before the sweep
+began. `#145`'s required checks were green — against *that* main. Landing it
+on top of `#148` put a lockfile on `main` that no longer matched its
+manifest, and `main` went red with `ERR_PNPM_OUTDATED_LOCKFILE` until a
+hand-written `#149` resynced it.
+
+Nothing in §14 could have caught this. `--match-head-commit` proves the
+*head* is the commit that was judged; it says nothing about the base, and
+the base is what the gate's own merges move. The rule had a blind spot the
+exact size of the gate's throughput: judge four green PRs against one base,
+merge all four, and the last three are merged against a base none of their
+checks ever saw.
+
+GitHub will not notice for us. Branch protection is `strict: false` in 57
+of 58 repos, so a moved base does not invalidate the PR's checks and does
+not re-run them, and — verified before choosing the signal — the pulls
+endpoint does not report it either. `trading-bot#107`, read 2026-09-01:
+`mergeable_state = clean`, `base.sha = 04086d68`, `main` at `5dedc9c8`,
+two commits later. Under `strict: false`, `behind` is a state the API never
+enters, so `mergeable_state` was rejected as the signal. What *is* reliable
+is `pulls/{n}.base.sha` itself: GitHub records it when the head is pushed
+and does not refresh it when the base moves, so it is precisely "the base
+this PR's checks ran against". The gate reads the branch head from
+`branches/{base}` and compares. Different means stale; stale never merges.
+
+That handles a base moved by anyone else. The base moved by *this sweep* is
+handled from memory, not from a ref read: after each merge the gate records
+`(repo, base_ref)`, and every later candidate on that base is stale by
+construction, without asking GitHub whether the ref has caught up with the
+merge that just returned. The consequence is stated plainly rather than
+left implicit: **one merge per base branch per sweep.** The second green PR
+in a repo waits — and the dry run records the same `moved` set, so a report
+shows one WOULD MERGE per repo, not the four the real run would refuse.
+
+What happens to a stale PR follows §17. Dependabot's get `@dependabot
+rebase` under the same 24-hour throttle, and land in their own report
+section, *STALE BASE (rebase requested)*, because nothing about them needs
+a human: the rebase re-runs the checks against the new base and the next
+sweep merges the result. A stale loop-produced PR — `#145` was a human's
+branch carrying the `automated` label — routes to review with the stale
+reason, because only its author can rebase it. A stale PR whose checks are
+red is reported as red: that is the actionable finding, and a rebase would
+re-run the same red checks.
+
+## VIII. What was deliberately not done
 
 - **The private control plane vendored these files until 2026-08-31.** The
   two copies were "kept in sync by `diff`", and nobody ran the diff:

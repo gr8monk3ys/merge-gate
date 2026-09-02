@@ -14,7 +14,7 @@ each story.
 
 ## The rule
 
-Three conditions. All required. No overrides.
+Four conditions. All required. No overrides.
 
 1. **The diff's shape is on the allowlist** — computed from the changed file
    paths, never from the title, the branch name, a label, or the loop that
@@ -25,6 +25,11 @@ Three conditions. All required. No overrides.
    that commit is what gets merged (`gh pr merge --match-head-commit`).
    Nothing is ever *armed*: an arm is standing permission to merge future
    content on the strength of a judgement about past content.
+4. **Those checks ran against the base branch's current head.** A PR's
+   `base.sha` is the base its checks saw; if the branch has moved since —
+   by anyone, or by this sweep's own previous merge — the green is stale
+   and the PR waits. One merge per base branch per sweep; a stale
+   Dependabot PR is asked to rebase, a stale loop PR routes to review.
 
 | Shape | Merges when | Never merges |
 |---|---|---|
@@ -52,7 +57,7 @@ diff vetoes — "I could not check" never resolves to "there is nothing there".
 ## Install
 
 ```sh
-pip install "merge-gate @ git+https://github.com/gr8monk3ys/merge-gate@v0.2.0"
+pip install "merge-gate @ git+https://github.com/gr8monk3ys/merge-gate@v0.3.0"
 ```
 
 That puts three console scripts on `PATH` — `merge-gate`, `ci-watchdog`,
