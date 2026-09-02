@@ -1,15 +1,23 @@
 #!/usr/bin/env python3
 """Phase 2: merge PRs that earn it — at their judged head — label the rest.
 
-Three conditions, ALL required, no overrides:
+Four conditions, ALL required, no overrides:
 
   1. diff shape is on the allowlist and carries no content veto
   2. the repo has >= 1 required status check on the base branch
   3. every required check is currently green
+  4. those checks ran against the base branch's CURRENT head
 
 Condition 2 is the one that was missing and is why dotfiles#41 merged with
 "no checks reported". A shape match on an ungated repo does NOT merge — it
 routes to review like anything else.
+
+Condition 4 is why finance-owl's main went red on 2026-09-02: the gate merged
+#148 and, 21 seconds later, #145 -- green, but green against the main that
+#148 had just replaced. Branch protection is `strict: false` almost
+everywhere here, so GitHub never re-runs checks on a moved base; the gate
+has to notice on its own, and it has to notice per merge, because its own
+merges are what move the base. One merge per base branch per sweep.
 
 Only machine-produced PRs are ever considered -- those labelled `automated`,
 those on an `auto/*` head branch, and dependabot's. Work opened by a human is
@@ -46,6 +54,9 @@ NEEDS_REVIEW = "needs-review"
 # conflict verdict to the self-heal in _evaluate. One definition, or a wording
 # tweak silently disables the rebase kick with no failure signal.
 CONFLICTING = "CONFLICTING with base"
+# Same contract: a prefix _evaluate matches on to decide who gets the rebase
+# kick. Reworded here, silently nobody is asked to rebase.
+STALE_BASE = "STALE BASE"
 REBASE_NAG_HOURS = 24  # at most one @dependabot rebase request per PR per day
 
 
@@ -163,35 +174,69 @@ def auto_merge_allowed(repo):
     return out.strip() == "true"
 
 
-def check_state(repo, number):
-    """Return (verdict, summary, head_sha): may this PR merge right now?
+def base_head(repo, branch):
+    out = sh_strict("api", f"repos/{repo}/branches/{branch}", "--jq", ".commit.sha")
+    if out is None:
+        raise ReadFailed(f"{repo}: branch {branch} not found")
+    return out.strip()
+
+
+def stale_base_reason(repo, base_ref, base_sha, moved=frozenset()):
+    """Why this PR's green checks describe a base that no longer exists, or None.
+
+    `pulls/{n}.base.sha` is the base commit GitHub recorded when the head was
+    last pushed -- the base its checks ran against. It is NOT refreshed when
+    the base branch moves, and with `strict: false` protection (57 of 58
+    repos here) `mergeable_state` stays `clean` rather than going `behind`:
+    trading-bot#107 read `clean` with base.sha two commits behind main on
+    2026-09-01. So the branch head is read directly and compared.
+
+    `moved` is the set of (repo, base_ref) this sweep has already merged
+    into. Every remaining candidate on such a base is stale by construction,
+    and saying so from memory rather than from a ref read means the verdict
+    cannot lose a race with the merge that caused it.
+    """
+    if (repo, base_ref) in moved:
+        return f"{STALE_BASE} — {base_ref} moved earlier this sweep"
+    head = base_head(repo, base_ref)
+    if head != base_sha:
+        return (f"{STALE_BASE} — checks ran against {base_sha[:8]}, "
+                f"{base_ref} is at {head[:8]}")
+    return None
+
+
+def check_state(repo, number, moved=frozenset()):
+    """Return (verdict, summary, head_sha, base_ref): may this PR merge now?
 
     None = never eligible as-is (draft, ungated repo); False = not now
-    (required checks red or missing, or conflicting with base); True = green.
-    head_sha is the exact commit the verdict describes — the caller must
-    merge THAT commit or nothing, which is what closes the re-arm race.
+    (required checks red or missing, conflicting with base, or green against
+    a base that has since moved); True = green and fresh. head_sha is the
+    exact commit the verdict describes — the caller must merge THAT commit
+    or nothing, which is what closes the re-arm race. base_ref is what the
+    caller records in `moved` after it merges, so the next candidate on the
+    same base is judged stale without a ref read.
     """
     out = sh_strict("api", f"repos/{repo}/pulls/{number}",
-                    "--jq", ".head.sha,.base.ref,.draft,.mergeable_state")
+                    "--jq", ".head.sha,.base.ref,.draft,.mergeable_state,.base.sha")
     if out is None:
         raise ReadFailed(f"{repo}#{number}: pull request not found")
     lines = out.splitlines()
-    if len(lines) < 4:
+    if len(lines) < 5:
         raise ReadFailed(f"{repo}#{number}: short response from pulls endpoint")
-    sha, base, draft, mstate = lines[0], lines[1], lines[2], lines[3]
+    sha, base, draft, mstate, base_sha = lines[:5]
 
     # A draft can never merge and can never be armed, however green it is.
     # 22 of 56 open PRs sat in this state while pr-shepherd reported them as
     # "awaiting-review" — they were never eligible for review to matter.
     if draft.strip().lower() == "true":
-        return None, "DRAFT — cannot merge until marked ready", sha
+        return None, "DRAFT — cannot merge until marked ready", sha, base
 
     if not auto_merge_allowed(repo):
-        return None, "repo has auto-merge disabled (no real test gate)", sha
+        return None, "repo has auto-merge disabled (no real test gate)", sha, base
 
     req = required_checks(repo, base)
     if not req:
-        return None, f"no required checks on {base}", sha
+        return None, f"no required checks on {base}", sha, base
 
     # An armed PR that goes CONFLICTING sits forever: auto-merge can never
     # fire on a dirty PR, however green its checks. finance-owl#69–79 sat
@@ -199,7 +244,7 @@ def check_state(repo, number):
     # all dirty over the shared lockfile — until rebases were requested by
     # hand. (Why only "dirty" counts: see is_conflict.)
     if is_conflict(mstate):
-        return False, CONFLICTING, sha
+        return False, CONFLICTING, sha, base
 
     out = sh_strict("api", f"repos/{repo}/commits/{sha}/check-runs",
                     "--jq", "[.check_runs[]|{name,conclusion}]")
@@ -214,10 +259,16 @@ def check_state(repo, number):
     failed = [c for c in req if by_name.get(c) not in (None, "success", "skipped")
               and c in by_name]
     if missing:
-        return False, f"required check(s) not run: {', '.join(missing)}", sha
+        return False, f"required check(s) not run: {', '.join(missing)}", sha, base
     if failed:
-        return False, f"required check(s) red: {', '.join(failed)}", sha
-    return True, f"green: {', '.join(req)}", sha
+        return False, f"required check(s) red: {', '.join(failed)}", sha, base
+    # Green -- against which base? Checked last so a red PR is still
+    # reported as red: that is the finding a reader can act on, and a rebase
+    # would only re-run the same red checks.
+    stale = stale_base_reason(repo, base, base_sha, moved)
+    if stale:
+        return False, stale, sha, base
+    return True, f"green: {', '.join(req)}", sha, base
 
 
 def request_rebase(repo, num):
@@ -250,8 +301,25 @@ def request_rebase(repo, num):
             else f" — rebase request failed: {err[:40]}")
 
 
-def _evaluate(pr, repo, num, data_dirs, armed, review, skipped):
-    """Reach a verdict for one PR and file it under armed / review / skipped.
+class Sweep:
+    """One run's verdicts, and the one piece of state that carries between
+    them: which base branches this sweep has already moved.
+
+    `moved` is filled in DRY_RUN too. The report must show what a real run
+    would do, and a real run merges one PR per base and stales the rest; a
+    dry run that listed four WOULD MERGE rows for one repo would be
+    describing the sweep that put finance-owl's main in the red.
+    """
+
+    def __init__(self):
+        self.armed, self.review, self.skipped = [], [], []
+        self.stale, self.failed = [], []
+        self.moved = set()   # {(repo, base_ref)}
+
+
+def _evaluate(pr, repo, num, data_dirs, s):
+    """Reach a verdict for one PR and file it under s.armed / review /
+    skipped / stale.
 
     Raises ReadFailed if GitHub never answered; main() files those separately
     so an unread PR is never printed as a decided one.
@@ -286,10 +354,10 @@ def _evaluate(pr, repo, num, data_dirs, armed, review, skipped):
             why += " — DISARMED (was armed outside the allowlist)"
             if not DRY_RUN:
                 sh("pr", "merge", str(num), "--repo", repo, "--disable-auto")
-        review.append((repo, num, why, pr["title"]))
+        s.review.append((repo, num, why, pr["title"]))
         return
 
-    green, detail, sha = check_state(repo, num)
+    green, detail, sha, base = check_state(repo, num, s.moved)
 
     # Standing arms are retired, allowlisted shape or not. An arm outlives
     # the judgement that granted it: finance-owl#72 was armed as nodemailer
@@ -303,15 +371,22 @@ def _evaluate(pr, repo, num, data_dirs, armed, review, skipped):
         sh("pr", "merge", str(num), "--repo", repo, "--disable-auto")
 
     if green is None:
-        skipped.append((repo, num, detail, pr["title"]))
+        s.skipped.append((repo, num, detail, pr["title"]))
         return
     if not green:
-        # Self-heal the finance-owl case: a conflicted dependabot PR never
-        # un-dirties itself if dependabot has not noticed. Loop-produced
-        # auto/* PRs get no such kick — only their loop can rewrite them.
-        if detail == CONFLICTING and conflict_self_heals(pr):
+        # Self-heal the finance-owl cases: a conflicted dependabot PR never
+        # un-dirties itself if dependabot has not noticed, and a stale one
+        # never re-runs its checks (strict:false) until it is rebased.
+        # Loop-produced auto/* PRs get no such kick — only their loop can
+        # rewrite them — so a stale one is a review item like any other.
+        kick = conflict_self_heals(pr) and (
+            detail == CONFLICTING or detail.startswith(STALE_BASE))
+        if kick:
             detail += request_rebase(repo, num)
-        review.append((repo, num, detail, pr["title"]))
+        if detail.startswith(STALE_BASE) and kick:
+            s.stale.append((repo, num, detail, pr["title"]))
+        else:
+            s.review.append((repo, num, detail, pr["title"]))
         return
 
     if not DRY_RUN:
@@ -323,17 +398,21 @@ def _evaluate(pr, repo, num, data_dirs, armed, review, skipped):
         code, _, err = sh("pr", "merge", str(num), "--repo", repo,
                           "--squash", "--match-head-commit", sha)
         if code != 0:
-            skipped.append((repo, num, f"merge refused: {err[:60]}",
-                            pr["title"]))
+            s.skipped.append((repo, num, f"merge refused: {err[:60]}",
+                              pr["title"]))
             return
-    armed.append((repo, num, f"{shape}; {detail}", pr["title"]))
+    s.armed.append((repo, num, f"{shape}; {detail}", pr["title"]))
+    # This merge moved the base. Every candidate still to come on it was
+    # judged -- by GitHub, when its checks ran -- against the base that no
+    # longer exists. #145 landed 21 seconds after #148 that way.
+    s.moved.add((repo, base))
 
 
 def main():
     print(f"=== merge_gate :: {'REPORT ONLY' if DRY_RUN else 'APPLYING'} ===\n")
     data_dirs = load_data_dirs()
     vis = repo_visibility() if ONLY_PUBLIC else {}
-    armed, review, skipped, failed = [], [], [], []
+    s = Sweep()
 
     for pr in fetch_open_prs():
         repo = pr["repository"]["nameWithOwner"]
@@ -343,11 +422,11 @@ def main():
         if ONLY_PUBLIC and vis.get(repo) != "PUBLIC":
             continue
         try:
-            _evaluate(pr, repo, num, data_dirs, armed, review, skipped)
+            _evaluate(pr, repo, num, data_dirs, s)
         except ReadFailed as e:
             # No verdict was reached. Say exactly that, in its own section,
             # rather than borrowing the wording of a decision.
-            failed.append((repo, num, str(e), pr["title"]))
+            s.failed.append((repo, num, str(e), pr["title"]))
 
     def dump(title, rows):
         print(f"=== {title} ({len(rows)}) ===")
@@ -355,22 +434,26 @@ def main():
             print(f"  {repo}#{num:<4} {t[:52]:<52} :: {why}")
         print()
 
-    dump("MERGED at judged head" if not DRY_RUN else "WOULD MERGE (judged head)", armed)
-    dump("ROUTED to review", review)
-    dump("SKIPPED (deliberately ungated repo)", skipped)
-    if failed:
-        dump("NO VERDICT — GitHub did not answer (retry; not a finding)", failed)
+    dump("MERGED at judged head" if not DRY_RUN else "WOULD MERGE (judged head)", s.armed)
+    # Green, allowlisted, and waiting only for dependabot to rebase onto the
+    # base that moved -- this sweep or earlier. Not a review item: nothing
+    # here needs a human, and the next sweep after the rebase merges it.
+    dump("STALE BASE (rebase requested)", s.stale)
+    dump("ROUTED to review", s.review)
+    dump("SKIPPED (deliberately ungated repo)", s.skipped)
+    if s.failed:
+        dump("NO VERDICT — GitHub did not answer (retry; not a finding)", s.failed)
 
     if not DRY_RUN:
-        for repo, num, _, _ in review:
+        for repo, num, _, _ in s.review:
             sh("pr", "edit", str(num), "--repo", repo, "--add-label", NEEDS_REVIEW)
 
-    print(f"merged={len(armed)} review={len(review)} "
-          f"skipped={len(skipped)} no_verdict={len(failed)}")
-    if failed:
+    print(f"merged={len(s.armed)} stale={len(s.stale)} review={len(s.review)} "
+          f"skipped={len(s.skipped)} no_verdict={len(s.failed)}")
+    if s.failed:
         # Loud, because a partial sweep that looks complete is how a drained
         # queue gets reported while a fifth of it was never examined.
-        print(f"⚠ {len(failed)} PR(s) got NO verdict. This run is incomplete.")
+        print(f"⚠ {len(s.failed)} PR(s) got NO verdict. This run is incomplete.")
     if DRY_RUN:
         print("\nRe-run with DRY_RUN=0 to merge judged heads and apply labels.")
     return 0

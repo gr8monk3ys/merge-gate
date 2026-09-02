@@ -250,3 +250,102 @@ def test_missing_repos_yml_degrades_only_for_data_dirs(tmp_path, monkeypatch):
     with pytest.raises(OSError):
         cp.parse_repos_yml()
     assert cp.load_data_dirs() == {}
+
+
+# --- base freshness ---------------------------------------------------------
+#
+# finance-owl, 2026-09-02: the gate merged #148 (sentry ^10.72.0 into
+# packages/backend/package.json) and, 21 seconds later, #145 -- a
+# lockfile-only PR whose green checks had run against the PREVIOUS main and
+# whose lockfile still said ^10.70.0. main went red with
+# ERR_PNPM_OUTDATED_LOCKFILE. Branch protection had strict:false, as in 57 of
+# 58 repos, so GitHub never re-ran anything on the moved base. The head rule
+# (--match-head-commit) had no counterpart for the base.
+
+def _gh(answers):
+    """A sh_strict stand-in: answer by the first key found in the argv."""
+    def fake(*args):
+        joined = " ".join(args)
+        for key, val in answers:
+            if key in joined:
+                return val
+        raise AssertionError(f"unexpected gh read: {joined}")
+    return fake
+
+
+def _green_repo(branch_head, base_sha="base0"):
+    return [
+        ("pulls/7 --jq .head.sha", f"h7\nmain\nfalse\nclean\n{base_sha}\n"),
+        (".auto_merge != null", "false"),
+        (".allow_auto_merge", "true"),
+        ("required_status_checks", '["ci"]'),
+        ("check-runs", '[{"name":"ci","conclusion":"success"}]'),
+        ("branches/main --jq .commit.sha", branch_head),
+    ]
+
+
+def test_mergeable_state_clean_is_not_evidence_the_base_is_fresh(monkeypatch):
+    # trading-bot#107, read 2026-09-01: mergeable_state=clean while base.sha
+    # sat two commits behind main. With strict:false GitHub never says
+    # "behind"; the only honest signal is base.sha against the branch head.
+    monkeypatch.setattr(mg, "sh_strict", _gh(_green_repo("base1")))
+    green, why, sha, base = mg.check_state("o/r", 7)
+    assert green is False
+    assert why.startswith(mg.STALE_BASE)
+    assert "base0" in why and "base1" in why
+    assert (sha, base) == ("h7", "main")
+
+
+def test_a_fresh_base_merges(monkeypatch):
+    monkeypatch.setattr(mg, "sh_strict", _gh(_green_repo("base0")))
+    assert mg.check_state("o/r", 7)[:2] == (True, "green: ci")
+
+
+def test_a_merge_this_sweep_stales_every_sibling_without_asking_github(monkeypatch):
+    # After the gate moves main, every other candidate in the repo is stale by
+    # construction. That verdict must not depend on a ref read racing the
+    # merge that just happened.
+    answers = [a for a in _green_repo("base0") if "branches/" not in a[0]]
+    monkeypatch.setattr(mg, "sh_strict", _gh(answers))   # branch read would raise
+    green, why, _, _ = mg.check_state("o/r", 7, moved={("o/r", "main")})
+    assert green is False
+    assert why.startswith(mg.STALE_BASE)
+
+
+def _bot_pr(num):
+    return {"number": num, "title": "bump x from 1.0.0 to 1.0.1", "body": "",
+            "author": {"login": "app/dependabot", "is_bot": True},
+            "labels": [], "headRefName": f"dependabot/npm_and_yarn/x-{num}"}
+
+
+def test_the_second_green_pr_in_a_repo_waits_for_the_next_sweep(monkeypatch):
+    # This is exactly how #145 landed 21s after #148: both green, both judged
+    # against the same pre-sweep main, both merged. One merge per base per
+    # sweep; the rest get a rebase request and a section of their own.
+    monkeypatch.setattr(mg, "changed_paths", lambda *a: ["uv.lock"])
+    monkeypatch.setattr(mg, "sh_strict", _gh(_green_repo("base0")))
+    monkeypatch.setattr(mg, "request_rebase", lambda *a: " — would request dependabot rebase")
+    s = mg.Sweep()
+    mg._evaluate(_bot_pr(7), "o/r", 7, {}, s)
+    mg._evaluate(_bot_pr(7), "o/r", 7, {}, s)
+    assert [r[1] for r in s.armed] == [7]
+    assert len(s.stale) == 1 and s.review == []
+    assert s.stale[0][2].startswith(mg.STALE_BASE)
+    assert s.stale[0][2].endswith("would request dependabot rebase")
+    assert ("o/r", "main") in s.moved
+
+
+def test_a_stale_loop_pr_routes_to_review_not_to_dependabot(monkeypatch):
+    # #145 was a human's PR carrying the `automated` label. Nothing can rebase
+    # it but its author, so it is a review item, not a rebase request.
+    monkeypatch.setattr(mg, "changed_paths", lambda *a: ["uv.lock"])
+    monkeypatch.setattr(mg, "sh_strict", _gh(_green_repo("base1")))
+    monkeypatch.setattr(mg, "request_rebase",
+                        lambda *a: pytest.fail("asked dependabot to rebase a loop PR"))
+    pr = {"number": 7, "title": "chore: refresh lockfile", "body": "",
+          "author": {"login": "alice", "is_bot": False},
+          "labels": [{"name": "automated"}], "headRefName": "fix/lockfile"}
+    s = mg.Sweep()
+    mg._evaluate(pr, "o/r", 7, {}, s)
+    assert s.armed == [] and s.stale == []
+    assert len(s.review) == 1 and s.review[0][2].startswith(mg.STALE_BASE)
