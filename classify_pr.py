@@ -218,11 +218,12 @@ def _semver(s):
     Tolerates `v7`, `7`, `7.0`, `1.2.3-rc1`, `^1.2.3`, `~1.2.3`. Returns None
     for a git SHA or a version RANGE.
 
-    Ranges must not be coerced. `>=9` would otherwise read as exactly 9.0.0
-    and `<8.0.0,>=7.4.4` as 8.0.0, so "Update pytest requirement from
-    <8.0.0,>=7.4.4 to >=9" would be scored as a confident 8->9 major when
-    what actually changed is a constraint, not a pin. Scoring a constraint
-    change as a version delta is a guess wearing a number.
+    Ranges must not be coerced. `<8.0.0,>=7.4.4` would otherwise read as
+    8.0.0, so "Update pytest requirement from <8.0.0,>=7.4.4 to >=9" would be
+    scored as a confident 8->9 major when what actually changed is a
+    constraint, not a pin. Scoring a constraint change as a version delta is
+    a guess wearing a number. The one range shape with an unambiguous number
+    in it -- a lone lower bound -- is handled by _floor(), not here.
     """
     s = (s or "").strip()
     if re.search(r'[<>,|*\s]', s):
@@ -233,11 +234,36 @@ def _semver(s):
     return tuple(int(x) if x else 0 for x in m.groups())
 
 
+# Exactly one lower bound and nothing else: `>=1.2.3`. A ceiling (`<8`), a
+# compound (`>=7.4.4,<8`) or an exclusion (`!=1.5`) does not match.
+_RE_FLOOR = re.compile(r'^>=\s*([^\s<>=!,|*]+)$')
+
+
+def _floor(s):
+    """The version a spec demands at minimum, or None if that is not knowable.
+
+    Dependabot's pip "requirement" PRs -- `update python-dotenv requirement
+    from >=1.2.2 to >=1.2.3` -- move a manifest's lower bound, not a pin.
+    Their body names no versions at all ("Updates the requirements on [pkg]
+    to permit the latest version"), so the title's bounds are the only delta
+    there is, and a lone `>=X` has exactly one number in it: the floor the
+    manifest will now demand. Comparing floors is not the range-coercion
+    guess that _semver() refuses -- `>=1.2.2` to `>=1.2.3` cannot mean
+    anything other than "1.2.3 is now the minimum".
+
+    Anything with a second constraint stays None: `<8.0.0,>=7.4.4` to `>=9`
+    also drops a ceiling, and what the resolver may now pick is unbounded
+    above, which no single number describes.
+    """
+    m = _RE_FLOOR.match((s or "").strip())
+    return _semver(m.group(1)) if m else _semver(s)
+
+
 def delta_kind(old, new):
     """Severity of a single version delta: patch | minor | major | unknown."""
     if _RE_SHA.match(old or "") and _RE_SHA.match(new or ""):
         return "sha"
-    a, b = _semver(old), _semver(new)
+    a, b = _floor(old), _floor(new)
     if a is None or b is None:
         return "unknown"
     if a[0] != b[0]:

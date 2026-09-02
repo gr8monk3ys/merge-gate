@@ -470,6 +470,39 @@ reason, because only its author can rebase it. A stale PR whose checks are
 red is reported as red: that is the actionable finding, and a rebase would
 re-run the same red checks.
 
+### 30. A lone lower bound is a version delta. A compound range still is not.
+
+Dependabot's pip *requirement* PRs — the ones that edit `pyproject.toml` or
+`requirements*.txt` instead of a lockfile — are titled *"update python-dotenv
+requirement from >=1.2.2 to >=1.2.3"*, and their body says, in full, *"Updates
+the requirements on [python-dotenv] to permit the latest version."* Under §10
+every `>=` spec was a range, every range was `unknown`, and `unknown` routed
+to a human: `letterboxd` #89–#94 and `trading-bot` #93/#94/#96/#107 all sat in
+review, most of them one-patch deltas.
+
+§6 says deltas come from the body, never the title, because a group title
+names no versions while its body tabulates them all. For this shape the body
+names *no versions at all* — there is no table and no "from a to b" line to
+prefer — so the title's bounds are the only delta the PR states, and reading
+them is the body rule applied to a body that is empty of numbers, not an
+exception to it. A group title (*"update the pip-minor group with 4
+updates"*) still has no numbers, still yields `None`, and still cannot merge
+on its title. There is a test.
+
+Why it is not the coercion §10 refuses: a lone `>=X` has exactly one number
+in it, and that number has exactly one meaning — the floor the manifest will
+now demand, which is what the resolver will ship on the next fresh install.
+`>=1.2.2 → >=1.2.3` cannot be anything but a patch. `_floor()` extracts it;
+`delta_kind()` scores it with the same `ZERO_MAJOR_MINOR_IS_BREAKING` rule
+every pin gets (`>=0.52.3 → >=0.52.4` is a `0.x` patch and merges;
+`>=0.122.0 → >=1.2.0` is a major and does not).
+
+A second constraint anywhere — `<8.0.0,>=7.4.4 → >=9`, `>=9,<10`, a bare
+ceiling — stays `unknown`. That PR also *drops a ceiling*, and what the
+resolver may now pick is unbounded above; no single number describes it.
+Checked read-only against the live PRs before landing: `letterboxd` 88
+major, 89 patch, 90 minor, 91 minor, 92 patch, 93 patch, 94 patch.
+
 ## VIII. What was deliberately not done
 
 - **The private control plane vendored these files until 2026-08-31.** The

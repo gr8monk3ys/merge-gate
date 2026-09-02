@@ -81,9 +81,68 @@ def test_unreadable_diff_vetoes():
     ("c3400c2f38909e0dcf3c3a41f2030a8217be5d3e",
      "c4dd10e44af883a891fe31ced449bcb4a6728b9b", "sha"),
     ("<8.0.0,>=7.4.4", ">=9", "unknown"),  # a range is not a version
+    # A lone lower bound is a floor, and the floor is what moved.
+    (">=1.2.2", ">=1.2.3", "patch"),
+    (">=0.52.3", ">=0.52.4", "patch"),      # 0.x patch is still a patch
+    (">=0.16.3", ">=0.16.5", "patch"),
+    (">=0.27.0", ">=0.41.0", "major"),      # 0.x minor is still breaking
+    (">=0.122.0", ">=1.2.0", "major"),
+    (">=3.15", ">=3.19", "minor"),
+    (">=6.1.1", ">=6.1.2", "patch"),
+    ("~=1.2.2", "~=1.2.3", "patch"),
+    ("==1.2.2", "==1.2.3", "patch"),
+    ("==1.2.2", "==2.0.0", "major"),
+    (">=7.4.4,<8", ">=9", "unknown"),       # a compound range is still not a version
+    (">=7.4.4", ">=9,<10", "unknown"),
+    ("<8.0.0", "<9.0.0", "unknown"),        # a ceiling alone says nothing about the floor
 ])
 def test_delta_kind(old, new, kind):
     assert cp.delta_kind(old, new) == kind
+
+
+# --- requirement-range bumps (pyproject / requirements.txt) ----------------
+#
+# Dependabot's pip "requirement" PRs say only "Updates the requirements on
+# [pkg](url) to permit the latest version" in the body -- no versions at all.
+# The title carries the bounds. See DECISIONS.md section 30.
+
+_BODY_REQUIREMENT = (
+    "Updates the requirements on [python-dotenv]"
+    "(https://github.com/theskumar/python-dotenv) to permit the latest "
+    "version.\n<details>\n<summary>Release notes</summary>\n</details>\n")
+
+
+@pytest.mark.parametrize("title,kind", [
+    ("chore(deps): update python-dotenv requirement from >=1.2.2 to >=1.2.3",
+     "patch"),
+    ("chore(deps): update uvicorn requirement from >=0.52.3 to >=0.52.4",
+     "patch"),
+    ("chore(deps): update anthropic requirement from >=0.122.0 to >=1.2.0",
+     "major"),
+    ("chore(deps-dev): update openai requirement from >=3.1.0 to >=3.6.0",
+     "minor"),
+    ("chore(deps): Update idna requirement from >=3.15 to >=3.19", "minor"),
+    ("Update pytest requirement from <8.0.0,>=7.4.4 to >=9", "unknown"),
+])
+def test_requirement_range_bump_reads_the_floor(title, kind):
+    assert cp.bump_kind(title, _BODY_REQUIREMENT) == kind
+
+
+def test_requirement_range_promotes_by_floor_delta():
+    body = _BODY_REQUIREMENT
+    patch = "chore(deps): update python-dotenv requirement from >=1.2.2 to >=1.2.3"
+    major = "chore(deps): update anthropic requirement from >=0.122.0 to >=1.2.0"
+    assert cp.promote_candidate("dependency-bump-candidate", patch, body) == \
+        "dependency-bump"
+    assert cp.promote_candidate("dependency-bump-candidate", major, body) == \
+        "mixed"
+
+
+def test_requirement_group_title_with_no_versions_stays_unknown():
+    title = ("chore(deps): update the pip-minor group across 1 directory "
+             "with 4 updates")
+    assert cp.bump_kind(title, "") is None
+    assert cp.bump_kind(title, _BODY_REQUIREMENT) is None
 
 
 def test_a_group_is_as_risky_as_its_worst_member():
