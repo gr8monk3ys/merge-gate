@@ -31,6 +31,7 @@ An approximation would instead be read as a fact about the repository.
 """
 
 import json
+import pathlib
 import os
 import re
 import shutil
@@ -124,6 +125,16 @@ def _request(method, path, body=None):
         req.add_header("Content-Type", "application/json")
     try:
         with urllib.request.urlopen(req, timeout=60) as resp:
+            # A write that was redirected did not necessarily happen where the
+            # caller meant it to. GitHub answers a request against a RENAMED
+            # repo with a redirect, and for PUT it discards the body -- so the
+            # call succeeds and nothing changes. Refuse rather than report a
+            # write that may not exist; the caller should resolve the
+            # canonical name first.
+            if method not in ("GET", "HEAD") and resp.url != url:
+                return 409, None, (f"gh: refusing a redirected {method} "
+                                   f"({url} -> {resp.url}); resolve the "
+                                   "canonical repo name first (HTTP 409)")
             raw = resp.read().decode()
             parsed = json.loads(raw) if raw.strip() else None
             return resp.status, parsed, resp.headers.get("Link", "")
@@ -324,8 +335,68 @@ def _flag(args, name):
 # subcommands
 
 
-def _cmd_api(args):
-    path = args[0]
+def _positional(args):
+    """The first argument that is not a flag or a flag's value.
+
+    `args[0]` is wrong: `gh api --method PUT repos/o/r/...` puts the verb
+    first, and reading the path as "--method" turned every write into a
+    request for a nonexistent endpoint -- silently, because the caller only
+    checked the exit code of a call that never reached the right URL.
+    """
+    takes_value = ("-X", "--method", "--jq", "-q", "-F", "-f", "--input",
+                   "-H", "--header")
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in takes_value:
+            i += 2
+            continue
+        if a.startswith("-"):
+            i += 1
+            continue
+        return a
+    raise Unsupported("gh api: no path in argv")
+
+
+def _body(args, stdin=None):
+    """Request body from `-F k=v` / `-f k=v` / `--input -` (or a file).
+
+    Without this the REST adapter parsed `--method PUT` and then sent nothing:
+    GitHub answered 2xx and changed nothing, so a branch-protection sweep
+    reported success having applied no protection at all. `-F` types its
+    values the way gh does (true/false/null/int stay JSON scalars, everything
+    else is a string); `--input` is already JSON and is passed through.
+    """
+    src = _flag(args, "--input")
+    if src is not None:
+        raw = (stdin if src == "-" else pathlib.Path(src).read_text())
+        if raw is None:
+            raise Unsupported("gh api --input -: nothing on stdin")
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError as e:
+            raise Unsupported(f"gh api --input: not JSON ({e})")
+
+    fields = {}
+    for name in ("-F", "-f"):
+        i = 0
+        while i < len(args) - 1:
+            if args[i] == name:
+                key, _, value = args[i + 1].partition("=")
+                if name == "-F":
+                    try:
+                        value = json.loads(value)
+                    except json.JSONDecodeError:
+                        pass          # a bare string, which is what gh sends
+                fields[key] = value
+                i += 2
+                continue
+            i += 1
+    return fields or None
+
+
+def _cmd_api(args, stdin=None):
+    path = _positional(args)
     method = _flag(args, "-X") or _flag(args, "--method") or "GET"
     jq_expr = _flag(args, "--jq") or _flag(args, "-q")
     paginate = "--paginate" in args
@@ -343,7 +414,7 @@ def _cmd_api(args):
                           else json.dumps(page, indent=2) + "\n")
         return Result(0, "".join(chunks))
 
-    status, parsed, link = _request(method, path)
+    status, parsed, link = _request(method, path, _body(args, stdin))
     if status >= 400:
         return Result(1, "", link)
     if jq_expr:
@@ -532,14 +603,17 @@ def _cmd_pr_write(args):
 # entry point
 
 
-def rest_run(argv):
-    """Execute a `gh` argv over REST. argv[0] is "gh"."""
+def rest_run(argv, stdin=None):
+    """Execute a `gh` argv over REST. argv[0] is "gh".
+
+    `stdin` is what a real `gh` would read for `--input -`.
+    """
     args = list(argv[1:])
     try:
         if not args:
             raise Unsupported("empty gh argv")
         if args[0] == "api":
-            return _cmd_api(args[1:])
+            return _cmd_api(args[1:], stdin)
         if args[0] == "repo" and len(args) > 1 and args[1] == "list":
             return _cmd_repo_list(args[2:])
         if args[0] == "pr" and len(args) > 1:
@@ -578,13 +652,18 @@ def binary_works():
     return ok
 
 
-def run(argv):
-    """Run a gh argv through whichever transport can answer."""
+def run(argv, stdin=None):
+    """Run a gh argv through whichever transport can answer.
+
+    `stdin` is the request body for `gh api --input -`. Both transports take
+    it, so a write is expressible the same way whichever one answers.
+    """
     if MODE == "rest":
-        return rest_run(argv)
+        return rest_run(argv, stdin)
     if MODE == "gh" or binary_works():
-        return subprocess.run(argv, capture_output=True, text=True)
-    return rest_run(argv)
+        return subprocess.run(argv, input=stdin, capture_output=True,
+                              text=True)
+    return rest_run(argv, stdin)
 
 
 # --------------------------------------------------------------------------

@@ -408,3 +408,60 @@ def test_a_stale_loop_pr_routes_to_review_not_to_dependabot(monkeypatch):
     mg._evaluate(pr, "o/r", 7, {}, s)
     assert s.armed == [] and s.stale == []
     assert len(s.review) == 1 and s.review[0][2].startswith(mg.STALE_BASE)
+
+
+# --------------------------------------------------------------------------
+# sweep() -- the queue has one author
+#
+# Everything that wants to know what the gate thinks used to rebuild this walk
+# from the primitives. Two such rebuilds drifted: they predated the
+# base-freshness rule, so a dashboard showed PRs as ready that the gate would
+# refuse to merge that sweep.
+
+
+def _queued(repo, number, title="t"):
+    return {"repository": {"nameWithOwner": repo}, "number": number,
+            "title": title, "body": ""}
+
+
+def test_sweep_returns_the_verdicts_and_prints_nothing(monkeypatch, capsys):
+    monkeypatch.setattr(mg, "fetch_open_prs",
+                        lambda: [_queued("o/a", 1), _queued("o/b", 2)])
+    monkeypatch.setattr(mg, "load_data_dirs", lambda: {})
+    monkeypatch.setattr(mg, "is_loop_produced", lambda repo, num, pr: True)
+
+    def fake_evaluate(pr, repo, num, data_dirs, s):
+        s.armed.append((repo, num, "why", pr["title"]))
+
+    monkeypatch.setattr(mg, "_evaluate", fake_evaluate)
+
+    s = mg.sweep()
+    assert [(r, n) for r, n, _, _ in s.armed] == [("o/a", 1), ("o/b", 2)]
+    assert capsys.readouterr().out == ""
+
+
+def test_sweep_files_unread_prs_separately_from_decided_ones(monkeypatch):
+    """A PR GitHub never answered for has no verdict, and must not borrow the
+    wording of one -- that is how a partial sweep reads as a drained queue."""
+    monkeypatch.setattr(mg, "fetch_open_prs", lambda: [_queued("o/a", 1)])
+    monkeypatch.setattr(mg, "load_data_dirs", lambda: {})
+    monkeypatch.setattr(mg, "is_loop_produced", lambda repo, num, pr: True)
+
+    def boom(pr, repo, num, data_dirs, s):
+        raise mg.ReadFailed("GitHub did not answer")
+
+    monkeypatch.setattr(mg, "_evaluate", boom)
+
+    s = mg.sweep()
+    assert s.armed == [] and s.review == []
+    assert len(s.failed) == 1
+
+
+def test_sweep_skips_prs_that_are_not_loop_produced(monkeypatch):
+    monkeypatch.setattr(mg, "fetch_open_prs", lambda: [_queued("o/a", 1)])
+    monkeypatch.setattr(mg, "load_data_dirs", lambda: {})
+    monkeypatch.setattr(mg, "is_loop_produced", lambda repo, num, pr: False)
+    monkeypatch.setattr(mg, "_evaluate",
+                        lambda *a: pytest.fail("evaluated a foreign PR"))
+    s = mg.sweep()
+    assert (s.armed, s.review, s.failed) == ([], [], [])

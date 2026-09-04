@@ -408,8 +408,20 @@ def _evaluate(pr, repo, num, data_dirs, s):
     s.moved.add((repo, base))
 
 
-def main():
-    print(f"=== merge_gate :: {'REPORT ONLY' if DRY_RUN else 'APPLYING'} ===\n")
+def sweep():
+    """Reach a verdict on every open PR and return the Sweep. Prints nothing.
+
+    Split out of main() so the queue has exactly one author. Anything else
+    that wants to know what the gate thinks -- a triage list, a dashboard, a
+    loop's summary count -- was previously rebuilding this walk from the
+    primitives, which is how a dashboard came to show PRs as ready that the
+    gate would refuse to merge that sweep: the rebuild predated the
+    base-freshness rule and nobody noticed, because the two answers were
+    never compared.
+
+    Honours DRY_RUN exactly as main() does; `Sweep.moved` is filled in either
+    mode, so a report describes the run a real one would perform.
+    """
     data_dirs = load_data_dirs()
     vis = repo_visibility() if ONLY_PUBLIC else {}
     s = Sweep()
@@ -427,6 +439,12 @@ def main():
             # No verdict was reached. Say exactly that, in its own section,
             # rather than borrowing the wording of a decision.
             s.failed.append((repo, num, str(e), pr["title"]))
+    return s
+
+
+def main():
+    print(f"=== merge_gate :: {'REPORT ONLY' if DRY_RUN else 'APPLYING'} ===\n")
+    s = sweep()
 
     def dump(title, rows):
         print(f"=== {title} ({len(rows)}) ===")
