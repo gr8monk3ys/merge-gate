@@ -7,3 +7,4 @@ __pycache__/
 repos.yml
 build/
 *.egg-info/
+uv.lock
