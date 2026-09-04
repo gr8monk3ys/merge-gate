@@ -508,6 +508,7 @@ _TRANSIENT = ("connection reset", "read tcp", "timeout", "eof",
               "tls: failed to verify", "certificate signed by unknown",
               "no such host",
               "rate limit", "secondary rate", "was submitted too quickly",
+              "abuse",
               "502", "503", "504", "bad gateway", "temporarily unavailable")
 
 
