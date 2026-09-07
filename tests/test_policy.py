@@ -12,6 +12,7 @@ import pytest
 
 import classify_pr as cp
 import merge_gate as mg
+from classify_pr import bump_kind as mg_bump_kind
 
 
 def test_builtin_selftests_pass(capsys):
@@ -465,3 +466,62 @@ def test_sweep_skips_prs_that_are_not_loop_produced(monkeypatch):
                         lambda *a: pytest.fail("evaluated a foreign PR"))
     s = mg.sweep()
     assert (s.armed, s.review, s.failed) == ([], [], [])
+
+
+# --------------------------------------------------------------------------
+# two-sided requirement ranges
+#
+# `_floor()` refuses anything with a second constraint, and is right to for
+# the case its docstring describes: `<8.0.0,>=7.4.4` to `>=9` drops the
+# ceiling, so what the resolver may pick is unbounded above. Two-sided TO
+# two-sided is not that case -- both ends are stated on both sides.
+#
+# Every title below is a real open PR in gr8monk3ys/g-m, hand-checked against
+# its versions. Four of the ten were being refused as `unknown` while being
+# patch or minor, which is why the repo held 13 stale bumps.
+
+
+@pytest.mark.parametrize("title,expected", [
+    # floor moves, ceiling unchanged -> the floor's severity
+    ("Update sqlalchemy requirement from <3.0.0,>=2.0.25 to >=2.0.51,<3.0.0",
+     "patch"),
+    ("Update email-validator requirement from <3.0.0,>=2.1.0 to >=2.3.0,<3.0.0",
+     "minor"),
+    ("Update pydantic requirement from <3.0.0,>=2.5.3 to >=2.13.4,<3.0.0",
+     "minor"),
+    ("Update pydantic-settings requirement from <3.0.0,>=2.1.0 to >=2.14.2,<3.0.0",
+     "minor"),
+    # floor crosses a major
+    ("Update bcrypt requirement from <6.0.0,>=4.1.2 to >=5.0.0,<6.0.0", "major"),
+    ("Update pillow requirement from <13.0.0,>=10.2.0 to >=12.3.0,<13.0.0",
+     "major"),
+    # ceiling crosses a major: admits a version the manifest excluded before
+    ("Update pytest requirement from <8.0.0,>=7.4.4 to >=9.1.1,<10.0.0", "major"),
+    ("Update uvicorn[standard] requirement from <0.41.0,>=0.27.0 to >=0.27.0,<0.43.0",
+     "major"),   # 0.x: the minor position is the breaking one
+    ("Update fastapi requirement from <0.110.0,>=0.109.0 to >=0.139.0,<0.140.0",
+     "major"),
+    ("Update uvicorn requirement from <0.41.0,>=0.27.0 to >=0.51.0,<0.52.0",
+     "major"),
+])
+def test_bounded_range_deltas(title, expected):
+    assert mg_bump_kind(title, "") == expected
+
+
+def test_a_range_that_loses_its_ceiling_is_still_unknown():
+    """The refusal _floor() documents must survive: `>=9` is unbounded above,
+    and no single number describes what the resolver may now pick."""
+    assert mg_bump_kind(
+        "Update pytest requirement from <8.0.0,>=7.4.4 to >=9", "") == "unknown"
+
+
+def test_a_lone_floor_still_scores_by_floor():
+    """merge-gate#5's rule is untouched."""
+    assert mg_bump_kind(
+        "Update starlette requirement from >=1.3.1 to >=1.6.0", "") == "minor"
+
+
+def test_the_worse_of_floor_and_ceiling_wins():
+    # A minor floor move with a major ceiling move is a major.
+    assert mg_bump_kind(
+        "Update x requirement from <2.0.0,>=1.1.0 to >=1.2.0,<3.0.0", "") == "major"

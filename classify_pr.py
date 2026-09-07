@@ -259,11 +259,61 @@ def _floor(s):
     return _semver(m.group(1)) if m else _semver(s)
 
 
+# A fully bounded range: a floor AND a ceiling, nothing else. `>=2.1.0,<3.0.0`
+# in either order. An exclusion (`!=1.5`) or a wildcard does not match.
+_RE_BOUNDED = re.compile(
+    r'^(?:>=\s*(?P<lo1>[^\s<>=!,|*]+)\s*,\s*<\s*(?P<hi1>[^\s<>=!,|*]+)'
+    r'|<\s*(?P<hi2>[^\s<>=!,|*]+)\s*,\s*>=\s*(?P<lo2>[^\s<>=!,|*]+))$')
+
+
+def _bounded(s):
+    """(floor, ceiling) when a spec pins both ends, else None.
+
+    `_floor()` refuses anything with a second constraint, and is right to for
+    the case it describes: `<8.0.0,>=7.4.4` to `>=9` drops the ceiling, so
+    what the resolver may now pick is unbounded above and no single number
+    describes it.
+
+    But two-sided TO two-sided is not that case. `>=2.1.0,<3.0.0` to
+    `>=2.14.2,<3.0.0` is fully described at both ends: the floor moved a
+    minor, the ceiling did not move at all, and nothing was opened up. Reading
+    it is not the range-coercion guess `_semver()` refuses -- both numbers are
+    stated.
+
+    Measured on the fleet that produced this rule: of 10 such PRs open in one
+    repo, 4 were a floor moving within an unchanged major (sqlalchemy
+    2.0.25->2.0.51, pydantic 2.5.3->2.13.4) and were being refused as
+    `unknown` -- not by policy, but because nothing could read them.
+    """
+    m = _RE_BOUNDED.match((s or "").strip())
+    if not m:
+        return None
+    lo = _semver(m.group("lo1") or m.group("lo2"))
+    hi = _semver(m.group("hi1") or m.group("hi2"))
+    return (lo, hi) if lo and hi else None
+
+
 def delta_kind(old, new):
     """Severity of a single version delta: patch | minor | major | unknown."""
     if _RE_SHA.match(old or "") and _RE_SHA.match(new or ""):
         return "sha"
+
+    # Both ends pinned on both sides: judge the floor and the ceiling, take
+    # the worse. Raising a ceiling across a major admits a major the manifest
+    # previously excluded, which is exactly as risky as moving a pin there.
+    ob, nb = _bounded(old), _bounded(new)
+    if ob and nb:
+        return max((_triple_kind(ob[0], nb[0]), _triple_kind(ob[1], nb[1])),
+                   key=lambda k: _SEVERITY[k])
+
     a, b = _floor(old), _floor(new)
+    if a is None or b is None:
+        return "unknown"
+    return _triple_kind(a, b)
+
+
+def _triple_kind(a, b):
+    """Severity between two version triples."""
     if a is None or b is None:
         return "unknown"
     if a[0] != b[0]:
