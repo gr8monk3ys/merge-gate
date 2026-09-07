@@ -605,3 +605,70 @@ def test_unread_prs_are_still_separate_from_unreached_ones(monkeypatch):
     ticks = iter([0, 0, 99])
     s = mg.sweep(deadline=10, clock=lambda: next(ticks))
     assert len(s.failed) == 2 and s.unreached == 1
+
+
+# --------------------------------------------------------------------------
+# the watchdog's Budget
+#
+# Same reasoning as sweep()'s: a watchdog killed by its supervisor makes a
+# fleet look unwatched and healthy for identical reasons. It timed out daily
+# for two days that way.
+
+import ci_watchdog as cw
+
+
+def _stub_scan(monkeypatch, verdicts):
+    """verdicts: {repo: (severity, why)}"""
+    monkeypatch.setattr(cw, "verdict", lambda r: verdicts[r])
+
+
+def test_no_budget_scans_every_repo(monkeypatch):
+    repos = [f"o/r{i}" for i in range(4)]
+    _stub_scan(monkeypatch, {r: (None, "") for r in repos})
+    flagged, healthy, no_ci, unreached = cw.scan(repos)
+    assert healthy == 4 and unreached == 0
+
+
+def test_an_expired_budget_scans_nothing_and_says_so(monkeypatch):
+    repos = [f"o/r{i}" for i in range(4)]
+    _stub_scan(monkeypatch, {r: (None, "") for r in repos})
+    flagged, healthy, no_ci, unreached = cw.scan(repos, deadline=0,
+                                                 clock=lambda: 100)
+    assert healthy == 0 and unreached == 4
+
+
+def test_a_partial_scan_keeps_what_it_judged(monkeypatch):
+    repos = [f"o/r{i}" for i in range(4)]
+    _stub_scan(monkeypatch, {r: ("BROKEN", "red") for r in repos})
+    ticks = iter([0, 0, 99, 99])
+    flagged, healthy, no_ci, unreached = cw.scan(repos, deadline=10,
+                                                 clock=lambda: next(ticks))
+    assert len(flagged) == 2 and unreached == 2
+
+
+def test_a_repo_is_judged_whole_or_not_at_all(monkeypatch):
+    seen = []
+
+    def verdict(r):
+        seen.append(r)
+        return (None, "")
+
+    monkeypatch.setattr(cw, "verdict", verdict)
+    repos = [f"o/r{i}" for i in range(3)]
+    ticks = iter([0, 99, 99])
+    _, _, _, unreached = cw.scan(repos, deadline=10, clock=lambda: next(ticks))
+    assert seen == ["o/r0"] and unreached == 2
+
+
+def test_an_unread_repo_is_not_an_unreached_one(monkeypatch):
+    """`?` means a verdict was attempted and GitHub did not answer.
+    `unreached` means it was never attempted."""
+    def verdict(r):
+        raise cw.ReadFailed("GitHub did not answer")
+
+    monkeypatch.setattr(cw, "verdict", verdict)
+    repos = [f"o/r{i}" for i in range(3)]
+    ticks = iter([0, 0, 99])
+    flagged, _, _, unreached = cw.scan(repos, deadline=10,
+                                       clock=lambda: next(ticks))
+    assert [f[0] for f in flagged] == ["?", "?"] and unreached == 1
