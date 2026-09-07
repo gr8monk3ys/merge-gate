@@ -53,6 +53,7 @@ import datetime as dt
 import json
 import os
 import sys
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from classify_pr import _run_gh, all_repos  # noqa: E402
@@ -265,13 +266,24 @@ def verdict(repo):
 ORDER = {"BROKEN": 0, "STARTUP": 1, "SILENT": 2, "RED": 3, "NOTE": 4, "?": 5}
 
 
-def main():
-    wanted = set(sys.argv[1:])
-    repos = [r for r in all_repos()
-             if not wanted or r.split("/")[1] in wanted]
-    flagged, healthy, no_ci = [], 0, []
+def scan(repos, deadline=None, clock=time.monotonic):
+    """Verdicts for these repos. Stops at a Budget and says what it skipped.
 
-    for repo in repos:
+    Same reasoning as `merge_gate.sweep()`: this runs under a supervisor with
+    a hard timeout, and a walk that overruns is KILLED, producing nothing --
+    which for a watchdog means a fleet that looks unwatched and healthy for
+    identical reasons. It timed out daily for two days that way.
+
+    Returns (flagged, healthy, no_ci, unreached). A repo is judged whole or
+    not at all: the budget is checked between repos, never inside one.
+    """
+    flagged, healthy, no_ci = [], 0, []
+    unreached = 0
+
+    for i, repo in enumerate(repos):
+        if deadline is not None and clock() >= deadline:
+            unreached = len(repos) - i
+            break
         try:
             sev, why = verdict(repo)
         except ReadFailed as e:
@@ -285,6 +297,16 @@ def main():
             healthy += 1
         else:
             flagged.append((sev, repo, why))
+    return flagged, healthy, no_ci, unreached
+
+
+def main():
+    wanted = set(sys.argv[1:])
+    repos = [r for r in all_repos()
+             if not wanted or r.split("/")[1] in wanted]
+    budget = os.environ.get("WATCHDOG_BUDGET_SECONDS", "").strip()
+    deadline = (time.monotonic() + float(budget)) if budget else None
+    flagged, healthy, no_ci, unreached = scan(repos, deadline)
 
     flagged.sort(key=lambda f: (ORDER[f[0]], f[1]))
     print(f"=== ci_watchdog :: {len(repos)} repos, "
@@ -302,6 +324,13 @@ def main():
     # BROKEN and STARTUP survive to here only with required checks verified
     # red on an open PR head -- everything unverified or ungated was demoted
     # to NOTE in verdict() -- so both mean "merges are blocked, measured".
+    if unreached:
+        # A watchdog that examined four fifths of the fleet must not report
+        # like one that examined all of it -- "every repo's default branch is
+        # green" would then be a claim about repos nobody looked at.
+        print(f"\n⚠ STOPPED AT BUDGET with {unreached} repo(s) unreached. "
+              "This scan is incomplete.")
+
     blocking = [f for f in flagged if f[0] in ("BROKEN", "STARTUP")]
     print(f"\nblocking={len(blocking)} other={len(flagged) - len(blocking)} "
           f"healthy={healthy}")
