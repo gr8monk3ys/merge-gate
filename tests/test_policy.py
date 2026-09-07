@@ -525,3 +525,83 @@ def test_the_worse_of_floor_and_ceiling_wins():
     # A minor floor move with a major ceiling move is a major.
     assert mg_bump_kind(
         "Update x requirement from <2.0.0,>=1.1.0 to >=1.2.0,<3.0.0", "") == "major"
+
+
+# --------------------------------------------------------------------------
+# the Budget
+#
+# Every caller runs under a supervisor with a hard timeout, and a walk that
+# overruns is KILLED -- producing nothing at all, not a partial answer. An
+# orchestrator saw three jobs fail that way daily for two days while its queue
+# sat undrained. Stopping at a budget and saying so beats being killed silent.
+
+
+def _queued(repo, number, title="t"):
+    return {"repository": {"nameWithOwner": repo}, "number": number,
+            "title": title, "body": ""}
+
+
+def _stub_sweep(monkeypatch, prs, evaluate=None):
+    monkeypatch.setattr(mg, "fetch_open_prs", lambda: prs)
+    monkeypatch.setattr(mg, "load_data_dirs", lambda: {})
+    monkeypatch.setattr(mg, "is_loop_produced", lambda repo, num, pr: True)
+    monkeypatch.setattr(mg, "_evaluate", evaluate or
+                        (lambda pr, repo, num, dd, s:
+                         s.armed.append((repo, num, "why", pr["title"]))))
+
+
+def test_no_budget_walks_everything(monkeypatch):
+    _stub_sweep(monkeypatch, [_queued("o/a", i) for i in range(5)])
+    s = mg.sweep()
+    assert len(s.armed) == 5
+    assert s.stopped_early is False and s.unreached == 0
+
+
+def test_an_expired_budget_stops_before_the_first_pr(monkeypatch):
+    _stub_sweep(monkeypatch, [_queued("o/a", i) for i in range(5)])
+    s = mg.sweep(deadline=0, clock=lambda: 100)
+    assert s.armed == []
+    assert s.stopped_early is True and s.unreached == 5
+
+
+def test_a_budget_that_expires_midway_keeps_what_it_reached(monkeypatch):
+    _stub_sweep(monkeypatch, [_queued("o/a", i) for i in range(5)])
+    ticks = iter([0, 0, 0, 99, 99])          # expires before the 4th PR
+    s = mg.sweep(deadline=10, clock=lambda: next(ticks))
+    assert len(s.armed) == 3
+    assert s.stopped_early is True and s.unreached == 2
+
+
+def test_a_generous_budget_does_not_stop(monkeypatch):
+    _stub_sweep(monkeypatch, [_queued("o/a", i) for i in range(3)])
+    s = mg.sweep(deadline=1e9, clock=lambda: 0)
+    assert len(s.armed) == 3 and s.stopped_early is False
+
+
+def test_the_budget_is_checked_between_prs_never_during(monkeypatch):
+    """A PR is judged whole or not at all. Half a verdict is what `failed`
+    exists to prevent, and a budget must not invent a new way to produce one."""
+    seen = []
+
+    def evaluate(pr, repo, num, dd, s):
+        seen.append(num)
+        s.armed.append((repo, num, "why", pr["title"]))
+
+    _stub_sweep(monkeypatch, [_queued("o/a", i) for i in range(4)], evaluate)
+    ticks = iter([0, 99, 99, 99])
+    s = mg.sweep(deadline=10, clock=lambda: next(ticks))
+    # One PR judged completely; no partial rows anywhere.
+    assert seen == [0]
+    assert len(s.armed) == 1 and s.unreached == 3
+
+
+def test_unread_prs_are_still_separate_from_unreached_ones(monkeypatch):
+    """`failed` means GitHub did not answer; `unreached` means we never
+    looked. Collapsing them would hide which one happened."""
+    def boom(pr, repo, num, dd, s):
+        raise mg.ReadFailed("GitHub did not answer")
+
+    _stub_sweep(monkeypatch, [_queued("o/a", i) for i in range(3)], boom)
+    ticks = iter([0, 0, 99])
+    s = mg.sweep(deadline=10, clock=lambda: next(ticks))
+    assert len(s.failed) == 2 and s.unreached == 1

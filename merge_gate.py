@@ -39,6 +39,7 @@ import datetime as dt
 import json
 import os
 import sys
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from classify_pr import (  # noqa: E402
@@ -315,6 +316,11 @@ class Sweep:
         self.armed, self.review, self.skipped = [], [], []
         self.stale, self.failed = [], []
         self.moved = set()   # {(repo, base_ref)}
+        # Set when a Budget stopped the walk early. `unreached` is what was
+        # left, so a caller can say how much of the queue it never looked at
+        # rather than implying it looked at all of it.
+        self.stopped_early = False
+        self.unreached = 0
 
 
 def _evaluate(pr, repo, num, data_dirs, s):
@@ -408,8 +414,24 @@ def _evaluate(pr, repo, num, data_dirs, s):
     s.moved.add((repo, base))
 
 
-def sweep():
+def sweep(deadline=None, clock=time.monotonic):
     """Reach a verdict on every open PR and return the Sweep. Prints nothing.
+
+    `deadline` is a Budget: a `clock()` value past which the walk stops and
+    returns what it has. Injected, and so is the clock, because a run that
+    cannot be reproduced in a test is a run whose behaviour is a guess.
+
+    Why a budget exists at all: every caller here runs under a supervisor with
+    a hard timeout, and a walk that overruns is KILLED -- producing nothing at
+    all, not a partial answer. An orchestrator saw exactly that, three jobs
+    failing daily for two days while its queue sat undrained. Stopping at a
+    budget and saying so is strictly better than being killed and saying
+    nothing.
+
+    A stopped sweep is not a failed one. It reports the verdicts it reached
+    and `unreached` for the rest, the same way `failed` already separates "no
+    verdict" from a decision -- an incomplete answer that admits it is
+    incomplete.
 
     Split out of main() so the queue has exactly one author. Anything else
     that wants to know what the gate thinks -- a triage list, a dashboard, a
@@ -426,11 +448,18 @@ def sweep():
     vis = repo_visibility() if ONLY_PUBLIC else {}
     s = Sweep()
 
-    for pr in fetch_open_prs():
+    considered = [pr for pr in fetch_open_prs()
+                  if is_loop_produced(pr["repository"]["nameWithOwner"],
+                                      pr["number"], pr)]
+    for i, pr in enumerate(considered):
         repo = pr["repository"]["nameWithOwner"]
         num = pr["number"]
-        if not is_loop_produced(repo, num, pr):
-            continue
+        if deadline is not None and clock() >= deadline:
+            # Checked BEFORE the PR, never during: a PR is judged whole or not
+            # at all. Half a verdict is the thing `failed` exists to prevent.
+            s.stopped_early = True
+            s.unreached = len(considered) - i
+            break
         if ONLY_PUBLIC and vis.get(repo) != "PUBLIC":
             continue
         try:
@@ -444,7 +473,9 @@ def sweep():
 
 def main():
     print(f"=== merge_gate :: {'REPORT ONLY' if DRY_RUN else 'APPLYING'} ===\n")
-    s = sweep()
+    budget = os.environ.get("SWEEP_BUDGET_SECONDS", "").strip()
+    deadline = (time.monotonic() + float(budget)) if budget else None
+    s = sweep(deadline)
 
     def dump(title, rows):
         print(f"=== {title} ({len(rows)}) ===")
@@ -472,6 +503,10 @@ def main():
         # Loud, because a partial sweep that looks complete is how a drained
         # queue gets reported while a fifth of it was never examined.
         print(f"⚠ {len(s.failed)} PR(s) got NO verdict. This run is incomplete.")
+    if s.stopped_early:
+        print(f"⚠ STOPPED AT BUDGET with {s.unreached} PR(s) unreached. This "
+              "run is incomplete; the next sweep continues from the queue as "
+              "it then stands.")
     if DRY_RUN:
         print("\nRe-run with DRY_RUN=0 to merge judged heads and apply labels.")
     return 0
