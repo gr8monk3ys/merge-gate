@@ -652,6 +652,26 @@ def binary_works():
     return ok
 
 
+# How long one `gh` invocation may take before it is treated as failed.
+#
+# There was no limit here, and on 2026-09-10 that took the whole sensor stack
+# down: `gh pr list` wedged on particular repos -- one hung 24 minutes on a
+# single repo while `gh api rate_limit` answered in 0.35s at 5000/5000 -- and
+# every caller inherited the hang. ci_watchdog ran 2h against a 180s budget,
+# burning 0.63s of CPU blocked on an established socket; sync_fleet,
+# triage_prs and merge_gate did the same; hermes killed three of them with
+# SIGKILL and reported exit -9.
+#
+# The per-sweep budgets did not save it. WATCHDOG_BUDGET_SECONDS and
+# SWEEP_BUDGET_SECONDS are only checked BETWEEN repos, so a call that never
+# returns is never measured. A budget can only bound work that finishes.
+#
+# 120s is deliberately generous: the slowest healthy call observed is a
+# multi-page `gh pr list` on a large repo at ~20s, so this fires on a wedge
+# and not on a slow answer. Override with GH_CALL_TIMEOUT_SECONDS.
+CALL_TIMEOUT_SECONDS = int(os.environ.get("GH_CALL_TIMEOUT_SECONDS", "120"))
+
+
 def run(argv, stdin=None):
     """Run a gh argv through whichever transport can answer.
 
@@ -661,8 +681,18 @@ def run(argv, stdin=None):
     if MODE == "rest":
         return rest_run(argv, stdin)
     if MODE == "gh" or binary_works():
-        return subprocess.run(argv, input=stdin, capture_output=True,
-                              text=True)
+        try:
+            return subprocess.run(argv, input=stdin, capture_output=True,
+                                  text=True, timeout=CALL_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            # A wedged `gh` must fail THIS call, not the sweep. Returning a
+            # non-zero CompletedProcess keeps the contract every caller
+            # already handles -- they check returncode -- instead of raising
+            # a new exception type into code that has never seen one.
+            return subprocess.CompletedProcess(
+                argv, 124, stdout="",
+                stderr=(f"gh timed out after {CALL_TIMEOUT_SECONDS}s: "
+                        f"{' '.join(argv[:4])}"))
     return rest_run(argv, stdin)
 
 
