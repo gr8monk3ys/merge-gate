@@ -11,7 +11,10 @@ against real GitHub -- is an operator check and stays out of CI: it needs a
 credential and a fleet, neither of which CI has.
 """
 
+import importlib
 import json
+import subprocess
+import time
 
 import gh_transport
 import pytest
@@ -182,3 +185,54 @@ def test_a_redirected_read_is_fine(monkeypatch):
     status, parsed, _ = gh_transport._request("GET", "repos/o/old-name")
     assert status == 200
     assert parsed["full_name"] == "o/new-name"
+
+
+# --------------------------------------------------------------------------
+# A wedged `gh` must fail its own call, never the sweep.
+#
+# 2026-09-10: `gh pr list` hung on particular repos (24 minutes on one) while
+# `gh api rate_limit` answered in 0.35s. run() had no timeout, so every caller
+# inherited the hang: ci_watchdog ran 2h against a 180s budget on 0.63s of CPU,
+# and hermes SIGKILLed three jobs (exit -9). The per-sweep budgets never fired
+# because they are only checked BETWEEN repos -- a call that never returns is
+# never measured.
+
+
+def test_a_wedged_call_times_out_instead_of_hanging(monkeypatch):
+    monkeypatch.setattr(gh_transport, "MODE", "gh")
+    monkeypatch.setattr(gh_transport, "CALL_TIMEOUT_SECONDS", 1)
+    start = time.monotonic()
+    result = gh_transport.run(["sleep", "30"])
+    assert time.monotonic() - start < 10, "run() hung instead of timing out"
+    assert result.returncode == 124
+    assert "timed out" in result.stderr
+
+
+def test_a_timeout_is_reported_as_a_normal_failed_process(monkeypatch):
+    # Callers check returncode. Raising a new exception type into code that
+    # has never seen one would trade a hang for a crash.
+    monkeypatch.setattr(gh_transport, "MODE", "gh")
+    monkeypatch.setattr(gh_transport, "CALL_TIMEOUT_SECONDS", 1)
+    result = gh_transport.run(["sleep", "30"])
+    assert isinstance(result, subprocess.CompletedProcess)
+    assert result.stdout == ""
+    assert result.args == ["sleep", "30"]
+
+
+def test_a_fast_call_is_untouched(monkeypatch):
+    monkeypatch.setattr(gh_transport, "MODE", "gh")
+    monkeypatch.setattr(gh_transport, "CALL_TIMEOUT_SECONDS", 30)
+    result = gh_transport.run(["echo", "hello"])
+    assert result.returncode == 0
+    assert result.stdout.strip() == "hello"
+
+
+def test_the_timeout_is_overridable(monkeypatch):
+    # An operator on a slow link must be able to raise it without editing code.
+    monkeypatch.setenv("GH_CALL_TIMEOUT_SECONDS", "7")
+    reloaded = importlib.reload(gh_transport)
+    try:
+        assert reloaded.CALL_TIMEOUT_SECONDS == 7
+    finally:
+        monkeypatch.delenv("GH_CALL_TIMEOUT_SECONDS", raising=False)
+        importlib.reload(gh_transport)
