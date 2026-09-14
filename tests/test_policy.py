@@ -614,6 +614,8 @@ def test_unread_prs_are_still_separate_from_unreached_ones(monkeypatch):
 # fleet look unwatched and healthy for identical reasons. It timed out daily
 # for two days that way.
 
+import datetime as dt
+
 import ci_watchdog as cw
 
 
@@ -672,3 +674,51 @@ def test_an_unread_repo_is_not_an_unreached_one(monkeypatch):
     flagged, _, _, unreached = cw.scan(repos, deadline=10,
                                        clock=lambda: next(ticks))
     assert [f[0] for f in flagged] == ["?", "?"] and unreached == 1
+
+
+# --------------------------------------------------------------------------
+# a deleted workflow is history, not health
+#
+# finance-owl deleted "Deploy Production" on 2026-09-10; its last runs, all
+# red, stayed inside the 100-run window and the watchdog headlined the repo
+# BROKEN for four days over a workflow that no longer existed.
+
+def _stub_repo(monkeypatch, runs, live, red=(None, 0, "")):
+    monkeypatch.setattr(cw, "default_branch", lambda r: "main")
+    monkeypatch.setattr(cw, "default_branch_runs", lambda r, b, limit=100: runs)
+    monkeypatch.setattr(cw, "live_workflows", lambda r: live)
+    monkeypatch.setattr(cw, "required_red", lambda r, b: red)
+
+
+def _run(name, conclusion, days_ago=0):
+    at = (cw.NOW - dt.timedelta(days=days_ago)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return {"name": name, "conclusion": conclusion, "at": at}
+
+
+def test_a_deleted_workflows_red_runs_do_not_count(monkeypatch):
+    runs = [_run("CI", "success"), _run("Deploy Production", "failure", 1),
+            _run("Deploy Production", "failure", 3)]
+    _stub_repo(monkeypatch, runs, live={"CI"})
+    sev, why = cw.verdict("o/r")
+    assert sev is None and why.startswith("green")
+
+
+def test_a_live_workflows_red_runs_still_count(monkeypatch):
+    runs = [_run("CI", "success"), _run("Deploy Production", "failure", 1),
+            _run("Deploy Production", "failure", 3)]
+    _stub_repo(monkeypatch, runs, live={"CI", "Deploy Production"},
+               red=(["x"], 1, "PR #1"))
+    sev, why = cw.verdict("o/r")
+    assert sev == "BROKEN" and "Deploy Production" in why
+
+
+def test_an_unreadable_workflow_list_keeps_every_run(monkeypatch):
+    runs = [_run("CI", "success"), _run("Deploy Production", "failure", 1)]
+    _stub_repo(monkeypatch, runs, live=None, red=(["x"], 1, "PR #1"))
+    sev, _ = cw.verdict("o/r")
+    assert sev == "BROKEN"
+
+
+def test_only_deleted_workflows_reads_as_no_ci(monkeypatch):
+    _stub_repo(monkeypatch, [_run("Old", "failure")], live=set())
+    assert cw.verdict("o/r")[0] == "NOCI"
