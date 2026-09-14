@@ -112,6 +112,28 @@ def default_branch_runs(repo, branch, limit=100):
         return None
 
 
+def live_workflows(repo):
+    """Names of the workflows that still exist in the repo, or None if
+    GitHub did not say.
+
+    Runs outlive their workflow file. finance-owl deleted its Deploy
+    Production workflow on 2026-09-10 and the watchdog headlined it as
+    BROKEN for four more days, because the 100-run window still held that
+    workflow's last failures and nothing newer could ever replace them. A
+    workflow that no longer exists gates nothing and cannot be fixed; its
+    runs are history, not health. None (a failed read) keeps every run,
+    which fails toward noise rather than toward a hidden breakage.
+    """
+    r = _run_gh(["gh", "api", f"repos/{repo}/actions/workflows?per_page=100",
+                 "--jq", "[.workflows[]|select(.state==\"active\")|.name]"])
+    if r.returncode != 0 or not r.stdout.strip():
+        return None
+    try:
+        return set(json.loads(r.stdout))
+    except json.JSONDecodeError:
+        return None
+
+
 def required_red(repo, branch):
     """(red_contexts, total, where) for the repo's gating checks.
 
@@ -181,6 +203,9 @@ def verdict(repo):
     runs = default_branch_runs(repo, branch)
     if runs is None:
         return "?", "could not read Actions runs"
+    live = live_workflows(repo)
+    if live is not None:
+        runs = [r for r in runs if r["name"] in live]
     if not runs:
         return "NOCI", f"no CI runs on {branch}"
 
