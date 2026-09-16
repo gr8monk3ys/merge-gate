@@ -112,26 +112,39 @@ def default_branch_runs(repo, branch, limit=100):
         return None
 
 
-def live_workflows(repo):
-    """Names of the workflows that still exist in the repo, or None if
-    GitHub did not say.
+def live_workflows(repo, branch):
+    """Names of the workflows whose file still exists on `branch`, or None
+    if GitHub did not say.
 
     Runs outlive their workflow file. finance-owl deleted its Deploy
     Production workflow on 2026-09-10 and the watchdog headlined it as
     BROKEN for four more days, because the 100-run window still held that
-    workflow's last failures and nothing newer could ever replace them. A
-    workflow that no longer exists gates nothing and cannot be fixed; its
-    runs are history, not health. None (a failed read) keeps every run,
-    which fails toward noise rather than toward a hidden breakage.
+    workflow's last failures and nothing newer could ever replace them.
+
+    The workflows endpoint is not enough on its own: GitHub keeps a deleted
+    workflow registered as `active` indefinitely -- elementary-teacher-
+    website listed org-osv and org-codeql as active with no file behind
+    either -- so the file listing is what decides. Dependabot's `dynamic/`
+    entries have no file by design and never gate a merge, so they drop
+    out the same way. None (a failed read) keeps every run, which fails
+    toward noise rather than toward a hidden breakage.
     """
-    r = _run_gh(["gh", "api", f"repos/{repo}/actions/workflows?per_page=100",
-                 "--jq", "[.workflows[]|select(.state==\"active\")|.name]"])
-    if r.returncode != 0 or not r.stdout.strip():
+    w = _run_gh(["gh", "api", f"repos/{repo}/actions/workflows?per_page=100",
+                 "--jq", "[.workflows[]|{name,path}]"])
+    f = _run_gh(["gh", "api",
+                 f"repos/{repo}/contents/.github/workflows?ref={branch}",
+                 "--jq", "[.[]|select(.type==\"file\")|.name]"])
+    if w.returncode != 0 or not w.stdout.strip():
         return None
     try:
-        return set(json.loads(r.stdout))
+        workflows = json.loads(w.stdout)
+        # An empty directory is a 404, and a 404 here means "no files".
+        files = set(json.loads(f.stdout)) if f.returncode == 0 and f.stdout.strip() else set()
     except json.JSONDecodeError:
         return None
+    return {x["name"] for x in workflows
+            if x["path"].startswith(".github/workflows/")
+            and x["path"].rsplit("/", 1)[1] in files}
 
 
 def required_red(repo, branch):
@@ -203,7 +216,7 @@ def verdict(repo):
     runs = default_branch_runs(repo, branch)
     if runs is None:
         return "?", "could not read Actions runs"
-    live = live_workflows(repo)
+    live = live_workflows(repo, branch)
     if live is not None:
         runs = [r for r in runs if r["name"] in live]
     if not runs:
