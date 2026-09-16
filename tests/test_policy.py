@@ -615,6 +615,7 @@ def test_unread_prs_are_still_separate_from_unreached_ones(monkeypatch):
 # for two days that way.
 
 import datetime as dt
+import json
 
 import ci_watchdog as cw
 
@@ -686,7 +687,7 @@ def test_an_unread_repo_is_not_an_unreached_one(monkeypatch):
 def _stub_repo(monkeypatch, runs, live, red=(None, 0, "")):
     monkeypatch.setattr(cw, "default_branch", lambda r: "main")
     monkeypatch.setattr(cw, "default_branch_runs", lambda r, b, limit=100: runs)
-    monkeypatch.setattr(cw, "live_workflows", lambda r: live)
+    monkeypatch.setattr(cw, "live_workflows", lambda r, b: live)
     monkeypatch.setattr(cw, "required_red", lambda r, b: red)
 
 
@@ -722,3 +723,43 @@ def test_an_unreadable_workflow_list_keeps_every_run(monkeypatch):
 def test_only_deleted_workflows_reads_as_no_ci(monkeypatch):
     _stub_repo(monkeypatch, [_run("Old", "failure")], live=set())
     assert cw.verdict("o/r")[0] == "NOCI"
+
+
+def _stub_gh(monkeypatch, answers):
+    """answers: {substring of the api path: (returncode, stdout)}"""
+    class R:
+        def __init__(self, rc, out): self.returncode, self.stdout = rc, out
+
+    def run(cmd):
+        path = cmd[2]
+        for key, (rc, out) in answers.items():
+            if key in path:
+                return R(rc, out)
+        raise AssertionError(f"unexpected gh call {path}")
+    monkeypatch.setattr(cw, "_run_gh", run)
+
+
+def test_a_registered_workflow_with_no_file_is_not_live(monkeypatch):
+    """GitHub keeps a deleted workflow `active` forever; the file decides."""
+    _stub_gh(monkeypatch, {
+        "actions/workflows": (0, json.dumps([
+            {"name": "CI", "path": ".github/workflows/ci.yml"},
+            {"name": "org-osv", "path": ".github/workflows/org-osv.yml"},
+            {"name": "Dependabot Updates", "path": "dynamic/dependabot/dependabot-updates"},
+        ])),
+        "contents/.github/workflows": (0, json.dumps(["ci.yml"])),
+    })
+    assert cw.live_workflows("o/r", "main") == {"CI"}
+
+
+def test_an_empty_workflow_directory_means_nothing_is_live(monkeypatch):
+    _stub_gh(monkeypatch, {
+        "actions/workflows": (0, json.dumps([{"name": "Old", "path": ".github/workflows/old.yml"}])),
+        "contents/.github/workflows": (1, ""),      # 404: directory gone
+    })
+    assert cw.live_workflows("o/r", "main") == set()
+
+
+def test_an_unreadable_workflow_list_is_none(monkeypatch):
+    _stub_gh(monkeypatch, {"actions/workflows": (1, ""), "contents": (0, "[]")})
+    assert cw.live_workflows("o/r", "main") is None
