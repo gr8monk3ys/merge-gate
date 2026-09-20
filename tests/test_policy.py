@@ -312,6 +312,79 @@ def test_missing_repos_yml_degrades_only_for_data_dirs(tmp_path, monkeypatch):
     assert cp.load_data_dirs() == {}
 
 
+# --- all_repos() and the repo-scoped-session fallback -----------------------
+#
+# pr-shepherd, 2026-09-20: this package's own `gh repo list` cannot run at all
+# from a session whose GitHub credential is bound to a fixed set of attached
+# repos -- the proxy 403s org-wide listing with "sessions are bound to their
+# configured repositories", every retry included, because the endpoint itself
+# is refused, not this one call. `scripts/_shepherd_drive.py` worked around it
+# with a hand-maintained repo list monkeypatched over `all_repos`. These tests
+# cover the real fallback that replaces it: repos.yml, read the same way
+# every other consumer reads it.
+
+def _gh_stub(monkeypatch, rc, stdout="", stderr=""):
+    class R:
+        def __init__(self):
+            self.returncode, self.stdout, self.stderr = rc, stdout, stderr
+    monkeypatch.setattr(cp, "_run_gh", lambda argv: R())
+
+
+def _set_owners(monkeypatch, *owners):
+    """Point OWNERS at a fixed list for this test, reverted automatically.
+
+    `require_owners()` and `_repos_yml_fallback()` both read the module
+    global by name, so rebinding `cp.OWNERS` is enough -- no reload needed,
+    which matters here because a reload would re-run the module body and
+    silently replace the `_run_gh` stub these tests install alongside it.
+    """
+    monkeypatch.setenv("GATE_OWNERS", ",".join(owners))
+    monkeypatch.setattr(cp, "OWNERS", list(owners))
+
+
+def test_a_repo_scoped_session_falls_back_to_repos_yml(tmp_path, monkeypatch):
+    f = tmp_path / "repos.yml"
+    f.write_text(
+        "repos:\n"
+        "  orchestrator: {loops: [pr-shepherd]}\n"
+        "  crm: {loops: [pr-shepherd], owner: Vivancedata}\n"
+    )
+    monkeypatch.setenv("GATE_REPOS_YML", str(f))
+    _set_owners(monkeypatch, "gr8monk3ys", "Vivancedata")
+    _gh_stub(monkeypatch, 1, stderr=(
+        '{"message":"sessions are bound to their configured repositories"}'))
+    assert cp.all_repos() == ["Vivancedata/crm", "gr8monk3ys/orchestrator"]
+
+
+def test_an_entry_with_no_declared_owner_defaults_to_the_first_configured_one(
+        tmp_path, monkeypatch):
+    f = tmp_path / "repos.yml"
+    f.write_text("repos:\n  orchestrator: {}\n  merge-gate: {}\n")
+    monkeypatch.setenv("GATE_REPOS_YML", str(f))
+    _set_owners(monkeypatch, "gr8monk3ys")
+    assert cp._repos_yml_fallback() == [
+        "gr8monk3ys/merge-gate", "gr8monk3ys/orchestrator"]
+
+
+def test_a_fleet_credential_still_raises_on_any_other_failure(monkeypatch):
+    """A rate limit, a typo'd owner, a dropped scope -- never routed to the
+    offline fallback. Only the specific repo-scoped-session refusal is."""
+    _set_owners(monkeypatch, "gr8monk3ys")
+    _gh_stub(monkeypatch, 1, stderr="HTTP 403: rate limit exceeded")
+    with pytest.raises(RuntimeError, match="rate limit"):
+        cp.all_repos()
+
+
+def test_a_fleet_credential_that_lists_repos_never_touches_repos_yml(
+        monkeypatch):
+    """The common case: `gh repo list` answers, so the fallback is not
+    consulted at all -- confirmed here by not even setting GATE_REPOS_YML."""
+    monkeypatch.delenv("GATE_REPOS_YML", raising=False)
+    _set_owners(monkeypatch, "gr8monk3ys")
+    _gh_stub(monkeypatch, 0, stdout="gr8monk3ys/orchestrator\n")
+    assert cp.all_repos() == ["gr8monk3ys/orchestrator"]
+
+
 # --- base freshness ---------------------------------------------------------
 #
 # finance-owl, 2026-09-02: the gate merged #148 (sentry ^10.72.0 into

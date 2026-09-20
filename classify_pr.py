@@ -536,6 +536,12 @@ def parse_repos_yml(path=None):
             "base": body.get("base_branch"),
             "status": body.get("status", "?"),
             "data_dir": list(body.get("data_dir") or []),
+            # Which account owns this repo, when a bare key is ambiguous
+            # across OWNERS (one fleet can span a personal account and an
+            # org with overlapping repo names). None when the operator did
+            # not say -- all_repos()'s fallback then guesses the first
+            # configured owner, same as everywhere else that guess is made.
+            "owner": body.get("owner"),
         }
     return out
 
@@ -620,6 +626,41 @@ def conflict_self_heals(pr):
     return is_dependabot(pr)
 
 
+# Substring of the error a repo-scoped session's GitHub proxy returns for
+# `gh repo list` — not a GitHub API message, one that sandboxed runners
+# (Claude Code on the web, similar CI sandboxes) emit when the credential in
+# use can only see repos explicitly attached to the session, and org-wide
+# listing endpoints are refused outright rather than answered short. Matched
+# narrowly on purpose: a rate limit, a typo'd owner, or a dropped token scope
+# must still raise, per the docstring below. Only THIS specific refusal is
+# something an offline registry can stand in for.
+_REPO_SCOPED_SESSION_ERROR = "bound to their configured repositories"
+
+
+def _repos_yml_fallback():
+    """Every repos.yml entry as nameWithOwner, when GitHub cannot be listed.
+
+    Not a live count -- it does not know which entries are archived, renamed,
+    or gone, and returns everything the registry names regardless. That is
+    the correct trade for what calls this: a session whose credential cannot
+    enumerate the fleet at all would otherwise have nothing to count with, and
+    a registry a human maintains and `audit_repos_yml.py` checks against
+    GitHub is a better fallback than treating "cannot enumerate" as "empty".
+    Downstream calls (fetch_open_prs, gate writes) already handle one bad
+    repo in the list on its own terms -- a 404 or 403 for that one name --
+    rather than needing this function to have filtered it out first.
+
+    Raises the same way parse_repos_yml() does when the registry itself
+    cannot be read: a fallback that silently degrades to `[]` would make
+    all_repos() report a drained fleet, which is the exact failure this
+    exists to avoid.
+    """
+    owners = require_owners()
+    entries = parse_repos_yml()
+    return sorted(f"{entry.get('owner') or owners[0]}/{key}"
+                  for key, entry in entries.items())
+
+
 def all_repos():
     """Every non-archived repo under any OWNERS entry, from the repo-list API.
 
@@ -636,6 +677,17 @@ def all_repos():
     typo, a renamed org and a dropped token scope all present as "no repos", and
     quietly enumerating one owner where two were configured is precisely how a
     whole org stays out of the queue without anything looking wrong.
+
+    One exception to "raise on any failure": a session whose GitHub credential
+    is bound to a fixed set of repos (see `_REPO_SCOPED_SESSION_ERROR`) cannot
+    answer "list every repo under this owner" no matter how many times it is
+    asked -- retrying or widening OWNERS never fixes it, because the proxy
+    refuses the endpoint itself, not this particular call. Raising there would
+    make every caller fail closed forever in that environment. Falling back to
+    `repos.yml` for the WHOLE sweep (not just the owner that failed) keeps the
+    enumeration one consistent source rather than mixing a live partial list
+    with an offline one, which would double-count or silently drop repos
+    depending on which owner happened to answer first.
     """
     repos = []
     for owner in require_owners():
@@ -643,8 +695,11 @@ def all_repos():
             ["gh", "repo", "list", owner, "--limit", "500", "--no-archived",
              "--json", "nameWithOwner", "--jq", ".[].nameWithOwner"])
         if r.returncode != 0:
+            stderr = r.stderr or ""
+            if _REPO_SCOPED_SESSION_ERROR in stderr.lower():
+                return _repos_yml_fallback()
             raise RuntimeError(
-                f"cannot enumerate repos for {owner}: {r.stderr.strip()}")
+                f"cannot enumerate repos for {owner}: {stderr.strip()}")
         found = [l.strip() for l in r.stdout.splitlines() if l.strip()]
         if not found:
             raise RuntimeError(
