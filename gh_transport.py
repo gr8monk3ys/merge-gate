@@ -682,8 +682,8 @@ def run(argv, stdin=None):
         return rest_run(argv, stdin)
     if MODE == "gh" or binary_works():
         try:
-            return subprocess.run(argv, input=stdin, capture_output=True,
-                                  text=True, timeout=CALL_TIMEOUT_SECONDS)
+            r = subprocess.run(argv, input=stdin, capture_output=True,
+                               text=True, timeout=CALL_TIMEOUT_SECONDS)
         except subprocess.TimeoutExpired:
             # A wedged `gh` must fail THIS call, not the sweep. Returning a
             # non-zero CompletedProcess keeps the contract every caller
@@ -693,7 +693,28 @@ def run(argv, stdin=None):
                 argv, 124, stdout="",
                 stderr=(f"gh timed out after {CALL_TIMEOUT_SECONDS}s: "
                         f"{' '.join(argv[:4])}"))
+        if MODE != "gh" and graphql_refused(r):
+            # The binary works -- `gh api user` answered, so binary_works()
+            # said yes -- but this runner's proxy refuses GraphQL outright,
+            # and `gh pr list` / `gh repo list` / `gh pr merge` are GraphQL
+            # underneath. Every cloud routine hit this from 2026-09-21 on:
+            # the fleet could not be enumerated, so Admission refused every
+            # producing loop. The same argv over REST is the answer the
+            # proxy itself points at.
+            return rest_run(argv, stdin)
+        return r
     return rest_run(argv, stdin)
+
+
+# What a Claude Code session's GitHub proxy says when a call needs GraphQL.
+# Matched narrowly: any other failure must surface as itself.
+GRAPHQL_REFUSED = "graphql is not available"
+
+
+def graphql_refused(result):
+    """Did this `gh` call fail only because GraphQL is blocked here?"""
+    return (result.returncode != 0
+            and GRAPHQL_REFUSED in (result.stderr or "").lower())
 
 
 # --------------------------------------------------------------------------
