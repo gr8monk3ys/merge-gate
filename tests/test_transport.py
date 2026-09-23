@@ -236,3 +236,46 @@ def test_the_timeout_is_overridable(monkeypatch):
     finally:
         monkeypatch.delenv("GH_CALL_TIMEOUT_SECONDS", raising=False)
         importlib.reload(gh_transport)
+
+
+# A Claude Code session's proxy answers `gh api user` (so binary_works() says
+# yes) but refuses GraphQL, which `gh pr list` and `gh repo list` use. From
+# 2026-09-21 every cloud routine failed Admission on exactly this 403.
+
+GRAPHQL_403 = ("HTTP 403: GitHub GraphQL is not available from Claude Code "
+               "sessions; use the REST API (gh api repos/{owner}/{repo}/...).")
+
+
+def _binary_says(monkeypatch, returncode, stderr):
+    monkeypatch.setattr(gh_transport, "MODE", "auto")
+    monkeypatch.setattr(gh_transport, "binary_works", lambda: True)
+    monkeypatch.setattr(
+        gh_transport.subprocess, "run",
+        lambda argv, **kw: subprocess.CompletedProcess(argv, returncode, "", stderr))
+    calls = []
+    monkeypatch.setattr(gh_transport, "rest_run",
+                        lambda argv, stdin=None: calls.append(argv) or
+                        gh_transport.Result(0, "[]", ""))
+    return calls
+
+
+def test_graphql_refusal_falls_back_to_rest(monkeypatch):
+    calls = _binary_says(monkeypatch, 1, GRAPHQL_403)
+    r = gh_transport.run(["gh", "pr", "list", "--repo", "o/r"])
+    assert calls == [["gh", "pr", "list", "--repo", "o/r"]]
+    assert r.returncode == 0
+
+
+def test_other_failures_are_not_rerouted(monkeypatch):
+    calls = _binary_says(monkeypatch, 1, "HTTP 404: Not Found")
+    r = gh_transport.run(["gh", "pr", "list", "--repo", "o/r"])
+    assert calls == []
+    assert r.returncode == 1
+
+
+def test_forced_gh_mode_never_reroutes(monkeypatch):
+    calls = _binary_says(monkeypatch, 1, GRAPHQL_403)
+    monkeypatch.setattr(gh_transport, "MODE", "gh")
+    r = gh_transport.run(["gh", "pr", "list", "--repo", "o/r"])
+    assert calls == []
+    assert r.returncode == 1
