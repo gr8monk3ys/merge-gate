@@ -136,6 +136,13 @@ def live_workflows(repo, branch):
                  "--jq", "[.[]|select(.type==\"file\")|.name]"])
     if w.returncode != 0 or not w.stdout.strip():
         return None
+    if f.returncode != 0 and "404" not in (getattr(f, "stderr", "") or ""):
+        # Not an answer. Only a 404 means "no such directory"; anything else
+        # -- a blip, or a transport that cannot model the call -- used to be
+        # read as "no files", which filtered out every workflow and filed
+        # every repo in the fleet as NOCI in REST mode. The absence of an
+        # answer is never rendered as one (§22): keep every run instead.
+        return None
     try:
         workflows = json.loads(w.stdout)
         # An empty directory is a 404, and a 404 here means "no files".

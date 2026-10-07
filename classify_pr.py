@@ -21,7 +21,9 @@ import json
 import os
 import re
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 # Installed as a top-level module beside this one. Every gh call in the
 # package goes through it, so an environment with no usable `gh` binary --
@@ -40,6 +42,39 @@ import gh_transport
 # that need a non-empty fleet call require_owners() and fail loudly.
 OWNERS = [o.strip() for o in os.environ.get("GATE_OWNERS", "").split(",")
           if o.strip()]
+
+
+# How many GitHub reads run at once, from GATE_WORKERS (default 8).
+#
+# The sweep was serial: ~8 gh round-trips per PR, ~110 PRs, and on Windows
+# every call spawns gh.exe. The 2026-10-06 22:17 run spent its whole 420s
+# budget enumerating and judged nothing. Eight is well under GitHub's
+# concurrency guidance for secondary rate limits; raise it with care.
+def _workers_from_env():
+    raw = os.environ.get("GATE_WORKERS", "").strip()
+    try:
+        return max(1, int(raw)) if raw else 8
+    except ValueError:
+        return 8
+
+
+DEFAULT_WORKERS = _workers_from_env()
+
+
+class Abandoned(Exception):
+    """A read was given up on because the budget ran out. Its result is
+    never consulted, so it is neither a verdict nor a failure to reach one.
+    """
+
+
+def bail_if(stop):
+    """Raise Abandoned when `stop` (a threading.Event, or None) is set.
+
+    Called between gh calls by work running ahead of the budget, so a read
+    nobody will consult does not keep spending the supervisor's time.
+    """
+    if stop is not None and stop.is_set():
+        raise Abandoned()
 
 
 def require_owners():
@@ -745,7 +780,31 @@ def _search_total(query):
         return None
 
 
-def fetch_open_prs():
+class Enumeration:
+    """What one walk of the fleet's open PRs found, and how far it got.
+
+    A list of PRs cannot say whether it is the whole queue. This can:
+    `complete` is True only when every repo was asked and every repo
+    answered. The three ways a repo can be missing are kept apart because
+    they call for different actions -- `unreached` means the budget ran out
+    before it was asked (run again, or widen the budget), `unlisted` means
+    GitHub did not answer for it (retry; not a fact about the repo).
+    """
+
+    def __init__(self, repos):
+        self.repos = list(repos)
+        self.prs = []
+        self.listed = []        # repos whose open PRs were read
+        self.unlisted = []      # repos GitHub did not answer for
+        self.unreached = []     # repos never asked: the budget ran out first
+        self.stopped_early = False
+
+    @property
+    def complete(self):
+        return not self.stopped_early and not self.unlisted
+
+
+def enumerate_open_prs(deadline=None, clock=time.monotonic, workers=None):
     """Open PRs the gate should consider — enumerated PER REPO, never searched.
 
     `gh search prs --limit N` truncates at N silently: no error, no warning,
@@ -767,6 +826,14 @@ def fetch_open_prs():
     forgot the flag reported a drained queue that was nothing of the kind.
     Nothing about the policy is relaxed for bots: they still need an
     allowlisted shape and a green required check, exactly like anything else.
+
+    Repos are listed `workers` at a time, and `deadline` -- a `clock()` value,
+    both injected so a test can reproduce the run -- is checked between
+    repos. The walk used to be serial and unbudgeted: with ~110 repos and a
+    gh.exe spawn per call, one run spent its entire 420s budget in here, so
+    the sweep's own deadline, checked only after this returned, fired on the
+    first PR and the run reported zero verdicts. A stopped enumeration says
+    how far it got (`unreached`) instead of being killed saying nothing.
     """
     PER_REPO_LIMIT = 300
     include_bots = os.environ.get("INCLUDE_BOTS", "1") != "0"
@@ -774,10 +841,47 @@ def fetch_open_prs():
     # deltas for a group bump, whose title names no versions at all.
     fields = "number,title,body,labels,createdAt,author,isDraft,headRefName"
 
-    prs, truncated = [], []
-    for repo in all_repos():
-        rows = gh_json("pr", "list", "--repo", repo, "--state", "open",
-                       "--limit", str(PER_REPO_LIMIT), "--json", fields) or []
+    repos = all_repos()
+    e = Enumeration(repos)
+    stop = threading.Event()
+
+    def list_repo(repo):
+        bail_if(stop)
+        return gh_json("pr", "list", "--repo", repo, "--state", "open",
+                       "--limit", str(PER_REPO_LIMIT), "--json", fields)
+
+    results = {}
+    with ThreadPoolExecutor(max_workers=workers or DEFAULT_WORKERS) as pool:
+        futures = {repo: pool.submit(list_repo, repo) for repo in repos}
+        for i, repo in enumerate(repos):
+            if deadline is not None and clock() >= deadline:
+                # Out of time. Keep every answer already in hand, cancel what
+                # has not started, and let anything mid-call finish unread.
+                e.stopped_early = True
+                stop.set()
+                for rest in repos[i:]:
+                    f = futures[rest]
+                    if not f.cancel() and f.done():
+                        try:
+                            results[rest] = f.result()
+                        except Abandoned:
+                            pass
+                break
+            results[repo] = futures[repo].result()
+
+    truncated = []
+    for repo in repos:
+        if repo not in results:
+            e.unreached.append(repo)
+            continue
+        rows = results[repo]
+        if rows is None:
+            # gh did not answer for this repo. Not "no PRs here": the
+            # absence of an answer is never rendered as one (§22). The repo
+            # is reported, and its PRs are simply not in this walk.
+            e.unlisted.append(repo)
+            continue
+        e.listed.append(repo)
         if len(rows) >= PER_REPO_LIMIT:
             truncated.append(repo)
         for pr in rows:
@@ -787,7 +891,7 @@ def fetch_open_prs():
             # omits it because the repo is implied by the query; `gh search`
             # supplied it, and every caller still expects that shape.
             pr["repository"] = {"nameWithOwner": repo, "name": repo.split("/")[1]}
-            prs.append(pr)
+            e.prs.append(pr)
 
     if truncated:
         raise RuntimeError(
@@ -802,20 +906,40 @@ def fetch_open_prs():
     # The oracle must span the same owners as the enumeration, or it reports a
     # smaller expectation than reality and the "did we see everything?" check
     # passes by being asked the wrong question.
-    scope = "+".join(f"user:{o}" for o in OWNERS)
-    expected = _search_total(f"is:pr+is:open+{scope}+author:app/dependabot")
-    if include_bots and expected is not None:
-        got = sum(1 for p in prs if is_dependabot(p))
-        # Archived repos are excluded above but still counted by search, so
-        # seeing FEWER is expected; seeing more means the enumeration is wrong.
-        if got > expected:
-            raise RuntimeError(f"enumerated {got} dependabot PRs but search "
-                               f"reports {expected} — enumeration is wrong")
-        if expected - got > 0:
-            print(f"note: {expected - got} dependabot PR(s) sit in archived "
-                  f"repos and are excluded (search total={expected}, "
-                  f"actionable={got})", file=sys.stderr)
-    return prs
+    #
+    # Only a complete walk is asked the question: a stopped or partly
+    # unlisted one is already known to be short, and the oracle costs a call.
+    if include_bots and e.complete:
+        scope = "+".join(f"user:{o}" for o in OWNERS)
+        expected = _search_total(f"is:pr+is:open+{scope}+author:app/dependabot")
+        if expected is not None:
+            got = sum(1 for p in e.prs if is_dependabot(p))
+            # Archived repos are excluded above but still counted by search,
+            # so seeing FEWER is expected; seeing more means the enumeration
+            # is wrong.
+            if got > expected:
+                raise RuntimeError(f"enumerated {got} dependabot PRs but search "
+                                   f"reports {expected} — enumeration is wrong")
+            if expected - got > 0:
+                print(f"note: {expected - got} dependabot PR(s) sit in archived "
+                      f"repos and are excluded (search total={expected}, "
+                      f"actionable={got})", file=sys.stderr)
+    return e
+
+
+def fetch_open_prs(workers=None):
+    """Every open PR the gate should consider, as a list. See enumerate_open_prs.
+
+    No deadline, so the walk is complete unless GitHub declined to list a
+    repo -- which is said on stderr, because a caller holding a plain list
+    has no other way to learn that the list is short.
+    """
+    e = enumerate_open_prs(workers=workers)
+    if e.unlisted:
+        print(f"warning: {len(e.unlisted)} repo(s) could not be listed and "
+              f"are missing from this walk: {', '.join(e.unlisted[:6])}"
+              f"{' …' if len(e.unlisted) > 6 else ''}", file=sys.stderr)
+    return e.prs
 
 
 def changed_paths(repo, number):

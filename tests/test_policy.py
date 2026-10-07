@@ -434,15 +434,26 @@ def test_a_fresh_base_merges(monkeypatch):
     assert mg.check_state("o/r", 7)[:2] == (True, "green: ci")
 
 
-def test_a_merge_this_sweep_stales_every_sibling_without_asking_github(monkeypatch):
+def test_a_merge_this_sweep_stales_every_sibling_whatever_github_says(monkeypatch):
     # After the gate moves main, every other candidate in the repo is stale by
     # construction. That verdict must not depend on a ref read racing the
-    # merge that just happened.
-    answers = [a for a in _green_repo("base0") if "branches/" not in a[0]]
-    monkeypatch.setattr(mg, "sh_strict", _gh(answers))   # branch read would raise
+    # merge that just happened: here the branch read still answers "base0",
+    # the pre-merge head (reads run ahead of verdicts and may well predate
+    # the merge), and `moved` overrides it.
+    monkeypatch.setattr(mg, "sh_strict", _gh(_green_repo("base0")))
     green, why, _, _ = mg.check_state("o/r", 7, moved={("o/r", "main")})
     assert green is False
-    assert why.startswith(mg.STALE_BASE)
+    assert why.startswith(mg.STALE_BASE) and "moved earlier this sweep" in why
+
+
+def test_moved_is_consulted_in_judge_not_in_read(monkeypatch):
+    """The read half knows nothing about the sweep; the verdict half does.
+    Reads can therefore run in parallel while verdicts stay ordered."""
+    monkeypatch.setattr(mg, "sh_strict", _gh(_green_repo("base0")))
+    st = mg.read_state("o/r", 7)
+    assert mg.judge(st)[0] is True
+    assert mg.judge(st, moved={("o/r", "main")})[0] is False
+    assert mg.judge(st, moved={("o/other", "main")})[0] is True
 
 
 def _bot_pr(num):
@@ -498,17 +509,39 @@ def _queued(repo, number, title="t"):
             "title": title, "body": ""}
 
 
-def test_sweep_returns_the_verdicts_and_prints_nothing(monkeypatch, capsys):
-    monkeypatch.setattr(mg, "fetch_open_prs",
-                        lambda: [_queued("o/a", 1), _queued("o/b", 2)])
+def _enum(prs, repos=None, unreached=(), unlisted=(), stopped=False):
+    """An Enumeration as enumerate_open_prs() would return it, no network."""
+    e = cp.Enumeration(repos if repos is not None else
+                       sorted({p["repository"]["nameWithOwner"] for p in prs}))
+    e.prs = list(prs)
+    e.unreached, e.unlisted = list(unreached), list(unlisted)
+    e.stopped_early = stopped
+    return e
+
+
+class _Read:
+    """A stand-in Reading: enough for a stubbed _decide to file a row."""
+
+    def __init__(self, pr, repo, num):
+        self.pr, self.repo, self.num, self.title = pr, repo, num, pr["title"]
+
+
+def _stub_sweep(monkeypatch, prs, read=None, decide=None, enum=None):
+    """Stub the sweep's seams: enumeration, who counts, and the two halves."""
+    monkeypatch.setattr(mg, "enumerate_open_prs",
+                        lambda deadline=None, clock=None, workers=None:
+                        enum if enum is not None else _enum(prs))
     monkeypatch.setattr(mg, "load_data_dirs", lambda: {})
     monkeypatch.setattr(mg, "is_loop_produced", lambda repo, num, pr: True)
+    monkeypatch.setattr(mg, "_read", read or
+                        (lambda pr, repo, num, dd, cache=None, stop=None:
+                         _Read(pr, repo, num)))
+    monkeypatch.setattr(mg, "_decide", decide or
+                        (lambda r, s: s.armed.append((r.repo, r.num, "why", r.title))))
 
-    def fake_evaluate(pr, repo, num, data_dirs, s):
-        s.armed.append((repo, num, "why", pr["title"]))
 
-    monkeypatch.setattr(mg, "_evaluate", fake_evaluate)
-
+def test_sweep_returns_the_verdicts_and_prints_nothing(monkeypatch, capsys):
+    _stub_sweep(monkeypatch, [_queued("o/a", 1), _queued("o/b", 2)])
     s = mg.sweep()
     assert [(r, n) for r, n, _, _ in s.armed] == [("o/a", 1), ("o/b", 2)]
     assert capsys.readouterr().out == ""
@@ -517,28 +550,36 @@ def test_sweep_returns_the_verdicts_and_prints_nothing(monkeypatch, capsys):
 def test_sweep_files_unread_prs_separately_from_decided_ones(monkeypatch):
     """A PR GitHub never answered for has no verdict, and must not borrow the
     wording of one -- that is how a partial sweep reads as a drained queue."""
-    monkeypatch.setattr(mg, "fetch_open_prs", lambda: [_queued("o/a", 1)])
-    monkeypatch.setattr(mg, "load_data_dirs", lambda: {})
-    monkeypatch.setattr(mg, "is_loop_produced", lambda repo, num, pr: True)
-
-    def boom(pr, repo, num, data_dirs, s):
+    def boom(pr, repo, num, dd, cache=None, stop=None):
         raise mg.ReadFailed("GitHub did not answer")
 
-    monkeypatch.setattr(mg, "_evaluate", boom)
-
+    _stub_sweep(monkeypatch, [_queued("o/a", 1)], read=boom)
     s = mg.sweep()
     assert s.armed == [] and s.review == []
     assert len(s.failed) == 1
 
 
 def test_sweep_skips_prs_that_are_not_loop_produced(monkeypatch):
-    monkeypatch.setattr(mg, "fetch_open_prs", lambda: [_queued("o/a", 1)])
-    monkeypatch.setattr(mg, "load_data_dirs", lambda: {})
+    _stub_sweep(monkeypatch, [_queued("o/a", 1)],
+                read=lambda *a, **k: pytest.fail("read a foreign PR"))
     monkeypatch.setattr(mg, "is_loop_produced", lambda repo, num, pr: False)
-    monkeypatch.setattr(mg, "_evaluate",
-                        lambda *a: pytest.fail("evaluated a foreign PR"))
     s = mg.sweep()
     assert (s.armed, s.review, s.failed) == ([], [], [])
+
+
+def test_verdicts_are_filed_in_queue_order_whatever_order_reads_finish(monkeypatch):
+    """Reads overlap; verdicts do not. `moved` only means something if the
+    first green PR on a base is decided before the second is looked at."""
+    import time as _time
+
+    def slow_first(pr, repo, num, dd, cache=None, stop=None):
+        if num == 1:
+            _time.sleep(0.05)          # the first read finishes LAST
+        return _Read(pr, repo, num)
+
+    _stub_sweep(monkeypatch, [_queued("o/a", n) for n in (1, 2, 3)], read=slow_first)
+    s = mg.sweep(workers=3)
+    assert [n for _, n, _, _ in s.armed] == [1, 2, 3]
 
 
 # --------------------------------------------------------------------------
@@ -609,20 +650,6 @@ def test_the_worse_of_floor_and_ceiling_wins():
 # sat undrained. Stopping at a budget and saying so beats being killed silent.
 
 
-def _queued(repo, number, title="t"):
-    return {"repository": {"nameWithOwner": repo}, "number": number,
-            "title": title, "body": ""}
-
-
-def _stub_sweep(monkeypatch, prs, evaluate=None):
-    monkeypatch.setattr(mg, "fetch_open_prs", lambda: prs)
-    monkeypatch.setattr(mg, "load_data_dirs", lambda: {})
-    monkeypatch.setattr(mg, "is_loop_produced", lambda repo, num, pr: True)
-    monkeypatch.setattr(mg, "_evaluate", evaluate or
-                        (lambda pr, repo, num, dd, s:
-                         s.armed.append((repo, num, "why", pr["title"]))))
-
-
 def test_no_budget_walks_everything(monkeypatch):
     _stub_sweep(monkeypatch, [_queued("o/a", i) for i in range(5)])
     s = mg.sweep()
@@ -653,31 +680,390 @@ def test_a_generous_budget_does_not_stop(monkeypatch):
 
 def test_the_budget_is_checked_between_prs_never_during(monkeypatch):
     """A PR is judged whole or not at all. Half a verdict is what `failed`
-    exists to prevent, and a budget must not invent a new way to produce one."""
-    seen = []
+    exists to prevent, and a budget must not invent a new way to produce one.
 
-    def evaluate(pr, repo, num, dd, s):
-        seen.append(num)
-        s.armed.append((repo, num, "why", pr["title"]))
+    Reads may run ahead of the budget -- that is the point of overlapping
+    them -- but a read is not a verdict. Only _decide() files rows, and it
+    is never entered for a PR past the deadline."""
+    decided = []
 
-    _stub_sweep(monkeypatch, [_queued("o/a", i) for i in range(4)], evaluate)
+    def decide(r, s):
+        decided.append(r.num)
+        s.armed.append((r.repo, r.num, "why", r.title))
+
+    _stub_sweep(monkeypatch, [_queued("o/a", i) for i in range(4)], decide=decide)
     ticks = iter([0, 99, 99, 99])
     s = mg.sweep(deadline=10, clock=lambda: next(ticks))
     # One PR judged completely; no partial rows anywhere.
-    assert seen == [0]
+    assert decided == [0]
     assert len(s.armed) == 1 and s.unreached == 3
+
+
+def test_reads_in_flight_at_the_deadline_are_abandoned(monkeypatch):
+    """A read nobody will consult must not keep spending the supervisor's
+    time: once the budget is gone, a read gives up at its next gh call."""
+    import threading as _threading
+    started = _threading.Event()
+    outcome = {}
+
+    def read(pr, repo, num, dd, cache=None, stop=None):
+        if num == 0:
+            return _Read(pr, repo, num)
+        started.set()
+        stop.wait(5)                   # "inside a gh call" until the budget ends
+        try:
+            cp.bail_if(stop)           # what a real read does between calls
+        except cp.Abandoned:
+            outcome[num] = "abandoned"
+            raise
+        outcome[num] = "completed"
+        return _Read(pr, repo, num)
+
+    _stub_sweep(monkeypatch, [_queued("o/a", 0), _queued("o/a", 1)], read=read)
+    ticks = iter([0, 99])
+
+    def clock():
+        t = next(ticks)
+        if t == 99:
+            started.wait(5)            # the second read is in flight, not pending
+        return t
+
+    s = mg.sweep(deadline=10, clock=clock, workers=2)
+    assert started.is_set()
+    assert outcome == {1: "abandoned"}
+    assert len(s.armed) == 1 and s.unreached == 1 and s.failed == []
 
 
 def test_unread_prs_are_still_separate_from_unreached_ones(monkeypatch):
     """`failed` means GitHub did not answer; `unreached` means we never
     looked. Collapsing them would hide which one happened."""
-    def boom(pr, repo, num, dd, s):
+    def boom(pr, repo, num, dd, cache=None, stop=None):
         raise mg.ReadFailed("GitHub did not answer")
 
-    _stub_sweep(monkeypatch, [_queued("o/a", i) for i in range(3)], boom)
+    _stub_sweep(monkeypatch, [_queued("o/a", i) for i in range(3)], read=boom)
     ticks = iter([0, 0, 99])
     s = mg.sweep(deadline=10, clock=lambda: next(ticks))
     assert len(s.failed) == 2 and s.unreached == 1
+
+
+def test_an_enumeration_stopped_at_budget_is_reported_as_such(monkeypatch):
+    """The 2026-10-06 22:17 run: enumeration took the whole budget, the
+    sweep's own check fired on PR one, and the report said "109 PRs
+    unreached" as if the queue had been counted. Now it says how many repos
+    were never listed, and the sweep is marked stopped even if the PR walk
+    never began."""
+    e = _enum([], repos=[f"o/r{i}" for i in range(10)],
+              unreached=[f"o/r{i}" for i in range(3, 10)], stopped=True)
+    _stub_sweep(monkeypatch, [], enum=e)
+    s = mg.sweep(deadline=10, clock=lambda: 99)
+    assert s.stopped_early is True
+    assert (s.repos_total, s.repos_unreached) == (10, 7)
+    assert s.verdicts == 0
+
+
+def test_repos_github_would_not_list_are_carried_on_the_sweep(monkeypatch):
+    e = _enum([_queued("o/a", 1)], repos=["o/a", "o/b"], unlisted=["o/b"])
+    _stub_sweep(monkeypatch, [_queued("o/a", 1)], enum=e)
+    s = mg.sweep()
+    assert s.repos_unlisted == ["o/b"] and s.stopped_early is False
+    assert len(s.armed) == 1
+
+
+# --------------------------------------------------------------------------
+# the enumeration's own budget
+#
+# The sweep's deadline used to be checked only once fetch_open_prs() had
+# returned, and with ~110 repos listed serially (a gh.exe spawn per call on
+# Windows) that return came after the whole budget. The walk now checks the
+# deadline between repos and says which repos it never asked.
+
+
+def _stub_enumeration(monkeypatch, repos, rows, total=None):
+    """rows: {repo: list-of-PR-dicts | None (GitHub did not answer)}"""
+    monkeypatch.setattr(cp, "all_repos", lambda: list(repos))
+    monkeypatch.setattr(cp, "gh_json",
+                        lambda *args: rows.get(args[args.index("--repo") + 1]))
+    monkeypatch.setattr(cp, "_search_total",
+                        (lambda q: total) if total is not None else
+                        (lambda q: pytest.fail("oracle asked on an incomplete walk")))
+    monkeypatch.setattr(cp, "OWNERS", ["o"])
+
+
+def _row(num, login="app/dependabot"):
+    return {"number": num, "title": "t", "body": "", "labels": [],
+            "author": {"login": login, "is_bot": True}}
+
+
+def test_no_deadline_lists_every_repo(monkeypatch):
+    repos = [f"o/r{i}" for i in range(5)]
+    _stub_enumeration(monkeypatch, repos, {r: [_row(1)] for r in repos}, total=5)
+    e = cp.enumerate_open_prs(workers=3)
+    assert e.complete and len(e.prs) == 5 and e.unreached == []
+    # Repo order is the queue order, whatever order the threads finished in.
+    assert [p["repository"]["nameWithOwner"] for p in e.prs] == repos
+
+
+def test_an_expired_deadline_lists_nothing_and_says_so(monkeypatch):
+    repos = [f"o/r{i}" for i in range(4)]
+    _stub_enumeration(monkeypatch, repos, {r: [_row(1)] for r in repos})
+    e = cp.enumerate_open_prs(deadline=0, clock=lambda: 100, workers=1)
+    assert e.stopped_early and not e.complete
+    assert len(e.unreached) + len(e.listed) == 4
+    # Whatever finished before the deadline is kept; nothing is invented.
+    assert len(e.prs) == len(e.listed)
+
+
+def test_a_deadline_mid_walk_keeps_the_repos_it_reached(monkeypatch):
+    repos = [f"o/r{i}" for i in range(6)]
+    _stub_enumeration(monkeypatch, repos, {r: [_row(1)] for r in repos})
+    ticks = iter([0, 0, 0, 99, 99, 99])
+    # One worker, so repos are listed strictly in order and the count is exact.
+    e = cp.enumerate_open_prs(deadline=10, clock=lambda: next(ticks), workers=1)
+    assert e.stopped_early
+    assert e.listed[:3] == repos[:3] and len(e.prs) >= 3
+    assert set(e.unreached) <= set(repos[3:])
+    assert len(e.listed) + len(e.unreached) == 6
+
+
+def test_a_repo_github_would_not_list_is_unlisted_not_empty(monkeypatch):
+    """None from gh is "did not answer", and used to be rendered as "no PRs
+    in this repo" -- the absence of an answer printed as one (§22)."""
+    repos = ["o/a", "o/b", "o/c"]
+    _stub_enumeration(monkeypatch, repos, {"o/a": [_row(1)], "o/b": None, "o/c": []})
+    e = cp.enumerate_open_prs(workers=2)
+    assert e.unlisted == ["o/b"] and e.listed == ["o/a", "o/c"]
+    assert not e.complete                     # and so the oracle is not asked
+    assert len(e.prs) == 1
+
+
+def test_fetch_open_prs_warns_about_unlisted_repos(monkeypatch, capsys):
+    _stub_enumeration(monkeypatch, ["o/a", "o/b"], {"o/a": [_row(1)], "o/b": None})
+    prs = cp.fetch_open_prs(workers=2)
+    assert len(prs) == 1
+    assert "o/b" in capsys.readouterr().err
+
+
+def test_the_search_oracle_still_catches_an_overcount(monkeypatch):
+    repos = ["o/a", "o/b"]
+    _stub_enumeration(monkeypatch, repos, {r: [_row(1), _row(2)] for r in repos}, total=1)
+    with pytest.raises(RuntimeError, match="enumeration is wrong"):
+        cp.enumerate_open_prs(workers=2)
+
+
+def test_a_repo_at_the_per_repo_limit_still_refuses(monkeypatch):
+    _stub_enumeration(monkeypatch, ["o/a"], {"o/a": [_row(i) for i in range(300)]}, total=300)
+    with pytest.raises(RuntimeError, match="per-repo PR limit"):
+        cp.enumerate_open_prs(workers=1)
+
+
+def test_workers_come_from_the_environment():
+    assert cp._workers_from_env() >= 1
+    import os as _os
+    saved = _os.environ.get("GATE_WORKERS")
+    try:
+        _os.environ["GATE_WORKERS"] = "3"
+        assert cp._workers_from_env() == 3
+        _os.environ["GATE_WORKERS"] = "0"
+        assert cp._workers_from_env() == 1          # never zero threads
+        _os.environ["GATE_WORKERS"] = "lots"
+        assert cp._workers_from_env() == 8
+    finally:
+        if saved is None:
+            _os.environ.pop("GATE_WORKERS", None)
+        else:
+            _os.environ["GATE_WORKERS"] = saved
+
+
+# --------------------------------------------------------------------------
+# the exit status
+#
+# A sweep that judged nothing must not exit like one that judged everything.
+# The scheduler reads the status, not the prose: on 2026-10-06 the task
+# showed green over a run that printed STOPPED AT BUDGET with 109 PRs
+# unreached and zero rows.
+
+
+def _run_main(monkeypatch, sweep):
+    monkeypatch.setattr(mg, "sweep", lambda deadline=None: sweep)
+    monkeypatch.setattr(mg, "DRY_RUN", True)
+    return mg.main()
+
+
+def test_a_sweep_that_judged_nothing_at_the_budget_exits_nonzero(monkeypatch, capsys):
+    s = mg.Sweep()
+    s.stopped_early, s.unreached = True, 109
+    assert _run_main(monkeypatch, s) == mg.EXIT_NO_VERDICTS
+    assert mg.EXIT_NO_VERDICTS not in (0, 1)       # 1 is ci_watchdog's blocker
+    assert "did not happen" in capsys.readouterr().out
+
+
+def test_a_sweep_that_reached_some_verdicts_at_the_budget_exits_zero(monkeypatch):
+    s = mg.Sweep()
+    s.stopped_early, s.unreached = True, 15
+    s.review.append(("o/a", 1, "shape=mixed", "t"))
+    assert _run_main(monkeypatch, s) == 0
+
+
+def test_a_complete_sweep_with_nothing_to_judge_exits_zero(monkeypatch):
+    # An empty queue is a real, complete answer, not a failed run.
+    assert _run_main(monkeypatch, mg.Sweep()) == 0
+
+
+def test_no_verdict_rows_alone_do_not_count_as_verdicts(monkeypatch):
+    # `failed` is the absence of a verdict. Stopped at budget with only
+    # those is still a sweep that decided nothing.
+    s = mg.Sweep()
+    s.stopped_early, s.unreached = True, 3
+    s.failed.append(("o/a", 1, "GitHub did not answer", "t"))
+    assert _run_main(monkeypatch, s) == mg.EXIT_NO_VERDICTS
+
+
+# --------------------------------------------------------------------------
+# per-repo reads are cached within a sweep
+#
+# allow_auto_merge, the required checks on a base, and that base's head are
+# facts about the repo. They were re-read for every PR in it: twenty
+# Dependabot PRs cost sixty reads for three answers, and the sweep ran out
+# of budget before it ran out of queue.
+
+
+def _counting_gh(answers):
+    calls = []
+    fake = _gh(answers)
+
+    def counting(*args):
+        calls.append(" ".join(args))
+        return fake(*args)
+    return counting, calls
+
+
+def test_repo_level_reads_happen_once_per_repo_per_sweep(monkeypatch):
+    sh, calls = _counting_gh(_green_repo("base0"))
+    monkeypatch.setattr(mg, "sh_strict", sh)
+    monkeypatch.setattr(mg, "changed_paths", lambda *a: ["uv.lock"])
+    monkeypatch.setattr(mg, "request_rebase", lambda *a: "")
+    s, cache = mg.Sweep(), mg.RepoCache()
+    for n in (7, 7, 7):
+        mg._evaluate(_bot_pr(n), "o/r", n, {}, s, cache)
+    per_repo = [c for c in calls if ".allow_auto_merge" in c
+                or "required_status_checks" in c or "branches/main" in c]
+    assert len(per_repo) == 3           # one each, not one each per PR
+    assert sum(".head.sha" in c for c in calls) == 3     # per-PR reads stay per PR
+
+
+def test_a_failed_repo_read_is_not_cached(monkeypatch):
+    """One blip must not become a repo's worth of NO VERDICT rows."""
+    attempts = []
+
+    def flaky():
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise mg.ReadFailed("tls blip")
+        return True
+
+    cache = mg.RepoCache()
+    with pytest.raises(mg.ReadFailed):
+        cache.get(("allow_auto_merge", "o/r"), flaky)
+    assert cache.get(("allow_auto_merge", "o/r"), flaky) is True
+    assert cache.get(("allow_auto_merge", "o/r"), flaky) is True
+    assert len(attempts) == 2
+
+
+def test_the_cache_reads_a_key_once_across_threads():
+    import threading as _threading
+    from concurrent.futures import ThreadPoolExecutor as _Pool
+    reads = []
+    gate = _threading.Event()
+
+    def read():
+        reads.append(_threading.get_ident())
+        gate.wait(1)
+        return "v"
+
+    cache = mg.RepoCache()
+    with _Pool(max_workers=8) as pool:
+        futs = [pool.submit(cache.get, ("k",), read) for _ in range(8)]
+        gate.set()
+        assert {f.result() for f in futs} == {"v"}
+    assert len(reads) == 1
+
+
+# --------------------------------------------------------------------------
+# the base is re-read at the moment of the write
+#
+# Caching the branch head widens the window between "base read" and "merge"
+# from seconds to a whole sweep. §29 is a rule about the base at the moment
+# of the WRITE, so a real merge re-reads it once, uncached, right before.
+
+
+def _green_then_moved(moved_to):
+    """Cached read says base0 (fresh); the uncached re-read says the base has moved."""
+    seen = {"branches": 0}
+
+    def fake(*args):
+        joined = " ".join(args)
+        if "branches/main --jq .commit.sha" in joined:
+            seen["branches"] += 1
+            return "base0" if seen["branches"] == 1 else moved_to
+        return _gh(_green_repo("base0"))(*args)
+    return fake, seen
+
+
+def test_a_real_merge_rechecks_the_base_uncached_first(monkeypatch):
+    fake, seen = _green_then_moved("base1")
+    monkeypatch.setattr(mg, "sh_strict", fake)
+    monkeypatch.setattr(mg, "changed_paths", lambda *a: ["uv.lock"])
+    monkeypatch.setattr(mg, "request_rebase", lambda *a: " — would request dependabot rebase")
+    monkeypatch.setattr(mg, "DRY_RUN", False)
+    merges = []
+    monkeypatch.setattr(mg, "sh", lambda *a: merges.append(a) or (0, "", ""))
+    s = mg.Sweep()
+    mg._evaluate(_bot_pr(7), "o/r", 7, {}, s)
+    assert merges == []                        # nothing merged
+    assert s.armed == [] and len(s.stale) == 1
+    assert "base1" in s.stale[0][2]
+    assert seen["branches"] == 2               # cached read + the pre-write one
+
+
+def test_a_dry_run_does_not_pay_for_the_recheck(monkeypatch):
+    fake, seen = _green_then_moved("base1")
+    monkeypatch.setattr(mg, "sh_strict", fake)
+    monkeypatch.setattr(mg, "changed_paths", lambda *a: ["uv.lock"])
+    monkeypatch.setattr(mg, "DRY_RUN", True)
+    s = mg.Sweep()
+    mg._evaluate(_bot_pr(7), "o/r", 7, {}, s)
+    assert len(s.armed) == 1 and seen["branches"] == 1
+
+
+# --------------------------------------------------------------------------
+# writes are serial, on the sweep's own thread, after all of a PR's reads
+
+
+def test_writes_happen_on_the_calling_thread_never_in_a_reader(monkeypatch):
+    """Reads fan out; every write -- disarm, merge, label, rebase comment --
+    goes through sh() in _decide(), which the sweep runs itself."""
+    import threading as _threading
+    main_thread = _threading.get_ident()
+    threads = []
+
+    monkeypatch.setattr(mg, "sh_strict", _gh(_green_repo("base0")))
+    monkeypatch.setattr(mg, "changed_paths", lambda *a: ["uv.lock"])
+    monkeypatch.setattr(mg, "request_rebase", lambda *a: "")
+    monkeypatch.setattr(mg, "DRY_RUN", False)
+    monkeypatch.setattr(mg, "sh", lambda *a: threads.append(_threading.get_ident()) or (0, "", ""))
+    monkeypatch.setattr(mg, "load_data_dirs", lambda: {})
+    monkeypatch.setattr(mg, "is_loop_produced", lambda repo, num, pr: True)
+    # The same green PR three times over: _green_repo() answers for #7.
+    prs = [dict(_bot_pr(7), repository={"nameWithOwner": "o/r"}) for _ in range(3)]
+    monkeypatch.setattr(mg, "enumerate_open_prs",
+                        lambda deadline=None, clock=None, workers=None: _enum(prs))
+
+    s = mg.sweep(workers=3)
+    assert threads and set(threads) == {main_thread}
+    # One merge per base per sweep, with reads having run in parallel: the
+    # first green PR merges, the other two are stale by `moved`.
+    assert len(s.armed) == 1 and len(s.stale) == 2
+    assert all("moved earlier this sweep" in why for _, _, why, _ in s.stale)
 
 
 # --------------------------------------------------------------------------
@@ -799,15 +1185,16 @@ def test_only_deleted_workflows_reads_as_no_ci(monkeypatch):
 
 
 def _stub_gh(monkeypatch, answers):
-    """answers: {substring of the api path: (returncode, stdout)}"""
+    """answers: {substring of the api path: (returncode, stdout[, stderr])}"""
     class R:
-        def __init__(self, rc, out): self.returncode, self.stdout = rc, out
+        def __init__(self, rc, out, err=""):
+            self.returncode, self.stdout, self.stderr = rc, out, err
 
     def run(cmd):
         path = cmd[2]
-        for key, (rc, out) in answers.items():
+        for key, answer in answers.items():
             if key in path:
-                return R(rc, out)
+                return R(*answer)
         raise AssertionError(f"unexpected gh call {path}")
     monkeypatch.setattr(cw, "_run_gh", run)
 
@@ -828,9 +1215,20 @@ def test_a_registered_workflow_with_no_file_is_not_live(monkeypatch):
 def test_an_empty_workflow_directory_means_nothing_is_live(monkeypatch):
     _stub_gh(monkeypatch, {
         "actions/workflows": (0, json.dumps([{"name": "Old", "path": ".github/workflows/old.yml"}])),
-        "contents/.github/workflows": (1, ""),      # 404: directory gone
+        "contents/.github/workflows": (1, "", "gh: Not Found (HTTP 404)"),   # directory gone
     })
     assert cw.live_workflows("o/r", "main") == set()
+
+
+def test_a_file_listing_that_failed_for_any_other_reason_is_not_empty(monkeypatch):
+    """Only a 404 means "no files". A blip -- or a transport refusing a jq
+    form it cannot model -- used to read as an empty directory, which
+    filtered out every workflow and filed every repo as NOCI in REST mode."""
+    _stub_gh(monkeypatch, {
+        "actions/workflows": (0, json.dumps([{"name": "CI", "path": ".github/workflows/ci.yml"}])),
+        "contents/.github/workflows": (1, "", "gh-transport: unsupported jq expression"),
+    })
+    assert cw.live_workflows("o/r", "main") is None     # keep every run
 
 
 def test_an_unreadable_workflow_list_is_none(monkeypatch):

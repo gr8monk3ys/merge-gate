@@ -73,6 +73,45 @@ def test_pr_list_applies_its_jq_filter(monkeypatch):
     assert json.loads(r.stdout) == [{"number": 98}, {"number": 97}]
 
 
+def test_select_by_field_collects_the_matching_names():
+    """`[.[]|select(.type=="file")|.name]` -- ci_watchdog.live_workflows.
+
+    Unmodelled, this form exited nonzero and live_workflows() read that as
+    "the workflow directory is empty", so every repo in the fleet was NOCI
+    in REST mode: a plausible verdict produced by the transport failing
+    closed one layer below the code that interpreted it.
+    """
+    doc = [{"type": "file", "name": "ci.yml"}, {"type": "dir", "name": "lib"},
+           {"type": "file", "name": "release.yml"}, {"type": "symlink", "name": "x"}]
+    assert gh_transport.render(gh_transport.jq(
+        '[.[]|select(.type=="file")|.name]', doc)) == '["ci.yml","release.yml"]\n'
+    assert gh_transport.render(gh_transport.jq(
+        '[.[]|select(.type=="file")|.name]', [])) == "[]\n"
+    # A different field and value are not special-cased to `type`/`file`.
+    assert gh_transport.jq('[.[]|select(.state=="open")|.number]',
+                           [{"state": "open", "number": 1},
+                            {"state": "closed", "number": 2}]) == [[1]]
+
+
+def test_live_workflows_reads_in_rest_mode(monkeypatch):
+    """End to end through the REST route: the watchdog sees the files."""
+    import ci_watchdog as cw
+
+    payloads = {
+        "repos/o/r/actions/workflows?per_page=100": {"workflows": [
+            {"name": "CI", "path": ".github/workflows/ci.yml"},
+            {"name": "Old", "path": ".github/workflows/old.yml"},
+            {"name": "Dependabot Updates", "path": "dynamic/dependabot/dependabot-updates"},
+        ]},
+        "repos/o/r/contents/.github/workflows?ref=main": [
+            {"type": "file", "name": "ci.yml"}, {"type": "dir", "name": "shared"}],
+    }
+    monkeypatch.setattr(gh_transport, "MODE", "rest")
+    monkeypatch.setattr(gh_transport, "_request",
+                        lambda method, path, body=None: (200, payloads[path], ""))
+    assert cw.live_workflows("o/r", "main") == {"CI"}
+
+
 # --------------------------------------------------------------------------
 # request bodies
 #

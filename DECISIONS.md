@@ -503,6 +503,70 @@ resolver may now pick is unbounded above; no single number describes it.
 Checked read-only against the live PRs before landing: `letterboxd` 88
 major, 89 patch, 90 minor, 91 minor, 92 patch, 93 patch, 94 patch.
 
+### 31. The budget is checked where the time goes. Zero verdicts is a failure, and exits like one.
+
+The sweep took a deadline in v0.6.0 (ADR-0006 in the control plane) and
+checked it between PRs. It did not check it while *finding* the PRs.
+`fetch_open_prs()` listed ~110 repos serially, one `gh pr list` each, and
+on a Windows runner every call spawns `gh.exe`; then each PR cost about
+eight more serial round-trips. From 2026-10-04 the applying sweep stopped
+early on four runs out of fifteen -- 15, 27, 26 and 72 PRs unreached -- and
+on 2026-10-06 at 22:17 enumeration alone consumed the whole 420s budget:
+the first deadline check fired on the first PR, the report read
+`merged=0 stale=0 review=0 skipped=0 no_verdict=0` and
+`STOPPED AT BUDGET with 109 PR(s) unreached`, and the process exited 0.
+The scheduled task showed green. A sweep that judged nothing and said so
+quietly is a sweep nobody notices did not happen -- the §26 failure again,
+reached by a different road.
+
+Three changes, each a rule:
+
+- **The deadline is checked inside enumeration, between repos.** A stopped
+  enumeration reports which repos it never listed (`unreached`) separately
+  from which repos GitHub declined to list (`unlisted`, which used to be
+  rendered as "no PRs here" -- §22 had a gap). Only a complete walk is
+  cross-checked against the Search oracle (§18); an incomplete one is
+  already known to be short.
+- **Reads run in parallel; verdicts and writes run serially, in queue
+  order.** `_read()` fetches a PR's paths, its arm, and its mergeability
+  `State` and touches nothing on the Sweep; `_decide()` turns a `State`
+  into a verdict and performs the writes. The split exists because of §29:
+  a verdict depends on `Sweep.moved`, the bases this sweep has already
+  merged into, and that is only known once every earlier PR has been
+  decided. Eight readers can run ahead; the one decider cannot. A PR is
+  still judged whole or not at all -- a read in flight at the deadline is
+  abandoned and its PR counted unreached, never half-filed.
+- **Per-repo facts are read once per repo per sweep**: `allow_auto_merge`,
+  the required checks on a base, the base's head. They were being re-read
+  for every PR in the repo. Caching the branch head widens the window
+  between "base read" and "merge" from seconds to minutes, and §29 is a
+  rule about the base at the moment of the *write* -- so a real merge
+  re-reads the head once, uncached, immediately before `pr merge`. That
+  costs one read per merge, never one per PR, and the dry run does not
+  pay it. A failed per-repo read is not cached: one blip must not become a
+  repo's worth of NO VERDICT rows.
+
+And the exit status: **a sweep that stops at its budget with zero verdicts
+exits 3.** Zero (verdicts reached, complete or not) and one (what
+`ci_watchdog` means by a measured blocker) already have meanings. `failed`
+rows do not count as verdicts; they are the absence of one.
+
+### 32. The watchdog read "the transport cannot answer" as "no CI".
+
+`ci_watchdog.live_workflows()` listed workflow files with
+`--jq '[.[]|select(.type=="file")|.name]'`, a form the REST transport's jq
+subset did not model. §27 says an unmodelled form exits nonzero, and it did.
+But `live_workflows()` treated a nonzero file listing as a 404 -- "the
+directory is empty" -- so in REST mode every workflow was filtered out,
+every run was discarded, and every repo in the fleet was filed as NOCI: a
+plausible verdict, produced by a correct refusal one layer down being
+rendered as a fact one layer up. The form is modelled now, with a selftest
+case and a difftest form, and `live_workflows()` treats only a 404 as "no
+files" -- any other failure keeps every run, failing toward noise rather
+than toward a hidden breakage, as its docstring always promised. §27's
+warning that the form only one caller issues is the one the differential
+test will not cover held for a second time.
+
 ## VIII. What was deliberately not done
 
 - **The private control plane vendored these files until 2026-08-31.** The
