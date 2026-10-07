@@ -86,8 +86,30 @@ repo)* / *no verdict (GitHub did not answer — retry, not a finding)*.
 | `DRY_RUN` | `1` | `0` to merge and label. |
 | `INCLUDE_BOTS` | `1` | `0` to ignore Dependabot. Bots are roughly four fifths of a real queue; leaving them out is how a full queue reports as empty. |
 | `ONLY_PUBLIC` | unset | `1` to skip private repos — for GitHub's capped private-repo Actions minutes, not for safety. |
+| `SWEEP_BUDGET_SECONDS` | unset | Stop the walk after this many seconds and report what was reached. Checked while listing repos and before each PR is decided, never inside one. |
+| `GATE_WORKERS` | `8` | How many GitHub reads run at once: repo listings during enumeration, and per-PR reads during the sweep. Writes are always serial. |
 | `GATE_REPOS_YML` | `./repos.yml` | Path to the optional `repos.yml`. Absolute is safest — installed as a package there is no "next to the source file". |
 | `GH_TRANSPORT` | `auto` | `gh` forces the binary, `rest` forces the REST API. `auto` uses the binary only when it can actually authenticate. |
+
+### Exit status
+
+| Code | `merge-gate` | `ci-watchdog` |
+|---|---|---|
+| `0` | The sweep ran and reached verdicts. It may still be incomplete — the report says so in its own section — but something was judged. | Nothing blocking was measured. |
+| `1` | — | A required check is red at an open PR's head: every merge in that repo is blocked. |
+| `3` | The budget ran out before a single PR was judged. The report prints `STOPPED AT BUDGET`, and the status is non-zero so a scheduler shows the run red instead of green over a sweep that did not happen. |
+
+### How a sweep spends its budget
+
+Reads run in parallel (`GATE_WORKERS`); verdicts and writes run serially,
+in queue order, after each PR's reads are in. The order matters: a verdict
+depends on which base branches *this sweep* has already merged into, and
+that is only known once every earlier PR has been decided (rule 4 above).
+Per-repo facts — `allow_auto_merge`, the required checks on a base branch,
+that branch's head — are read once per repo per sweep, not once per PR.
+Before a real merge the base head is re-read once more, uncached, so the
+"checks ran against the current base" rule is enforced at the moment of the
+write and not against a value cached minutes earlier.
 
 ## The tools
 
@@ -144,6 +166,10 @@ python3 classify_pr.py --validate
 `--difftest` is deliberately **not** in CI: it needs a credential and a real
 fleet to compare against. It is the operator's check, run before trusting the
 REST route.
+
+On Windows, run `pytest` from Git Bash (or with Git's `usr/bin` on `PATH`):
+the transport's timeout tests shell out to `sleep`, which PowerShell and
+`cmd.exe` do not have.
 
 The tests are the policy written as statements — *a group is as risky as its
 worst member*, *the sentence period is not part of the version*, *only

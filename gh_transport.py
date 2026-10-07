@@ -252,6 +252,22 @@ def jq(expr, doc):
                        lambda g: _render_scalar(_path_get(item, g.group(1)[1:])),
                        m.group(2))]
 
+    # [.[]|select(.k=="v")|.f]  -- ci_watchdog's workflow-file listing.
+    #
+    # This form was issued for weeks before it was modelled. Unmodelled means
+    # nonzero (§27), and live_workflows() reads nonzero as "no files", so in
+    # REST mode every workflow was filtered out and every repo in the fleet
+    # read as NOCI -- a plausible verdict that was in fact the transport
+    # failing closed. Rejecting the form was right; silently rendering the
+    # rejection as "no CI" one layer up was the bug this closes.
+    m = re.fullmatch(r'\[\s*\.\[\]\s*\|\s*select\(\s*\.(\w+)\s*==\s*"([^"]*)"\s*\)'
+                     r'\s*\|\s*\.([\w.]+)\s*\]', e)
+    if m:
+        field, want, path = m.groups()
+        items = doc if isinstance(doc, list) else []
+        return [[_path_get(i, path) for i in items
+                 if isinstance(i, dict) and i.get(field) == want]]
+
     # [.a[]|{x,y,alias:.z}]  -- check-runs / workflow-runs projections
     m = re.fullmatch(r'\[\s*\.(\w+)\[\]\s*\|\s*\{(.+?)\}\s*\]', e)
     if m:
@@ -779,6 +795,15 @@ def selftest():
         # A comment with a null body must not crash the throttle read.
         ('any(.[]; .body|test("@dependabot (rebase|recreate)"))',
          [{"body": None}], "false\n"),
+        # The workflow-file listing. Unmodelled, this form exited nonzero and
+        # live_workflows() read that as "no files", so every repo was NOCI in
+        # REST mode. Directories are dropped; an empty listing is `[]`, not
+        # nothing.
+        ('[.[]|select(.type=="file")|.name]',
+         [{"type": "file", "name": "ci.yml"}, {"type": "dir", "name": "lib"},
+          {"type": "file", "name": "release.yml"}],
+         '["ci.yml","release.yml"]\n'),
+        ('[.[]|select(.type=="file")|.name]', [], "[]\n"),
     ]
     passed = 0
     for expr, doc, want in checks:
@@ -890,6 +915,10 @@ def difftest():
                        "/required_status_checks", "--jq", ".contexts"], True),
         (["gh", "api", f"repos/{repo}/pulls?state=open&per_page=1",
           "--jq", '.[0] // empty | "\\(.number) \\(.head.sha)"'], True),
+        # ci_watchdog.live_workflows. Issued by one caller, unmodelled for
+        # weeks, and the failure read as "no CI" rather than as a failure.
+        (["gh", "api", f"repos/{repo}/contents/.github/workflows?ref={branch}",
+          "--jq", '[.[]|select(.type=="file")|.name]'], True),
         # `pr list` with a --jq filter. Added after the REST side returned the
         # raw array here and a caller spliced it into an API path; a form that
         # only one script issues is exactly the one no differential test
