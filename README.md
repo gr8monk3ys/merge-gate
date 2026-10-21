@@ -3,7 +3,7 @@
 Auto-merge bot PRs across a fleet of repositories — only when a computation,
 not a person, says the diff is safe.
 
-Built for a fleet of ~60 repos where Dependabot and scheduled coding agents
+Built for a fleet of ~80 repos where Dependabot and scheduled coding agents
 open more pull requests than anyone can read. Review was the bottleneck, and
 the first attempt to fix it — an agent that "enabled auto-merge on anything
 green with an eligible shape" — judged shape by eye, armed a 197-file diff to
