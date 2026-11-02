@@ -567,6 +567,17 @@ than toward a hidden breakage, as its docstring always promised. §27's
 warning that the form only one caller issues is the one the differential
 test will not cover held for a second time.
 
+### 33. A free plan's 403 was read as GitHub not answering.
+
+GitHub answers a branch-protection read on a private repo on a free plan with
+403 "Upgrade to GitHub Pro or make this repository public". `sh_strict()` knew
+one kind of no, the 404, so it raised, and every PR in such a repo became NO
+VERDICT with "This run is incomplete" at the end of every sweep. That warning
+is meant to be read, and Vivancedata/crm kept it lit for good. The 403 names
+the plan, so it counts as the no it is: the PR reports "no required checks",
+which is also true. Only that wording matches. A 403 for a rate limit or a bad
+token is still GitHub not answering, and still raises.
+
 ## VIII. What was deliberately not done
 
 - **The private control plane vendored these files until 2026-08-31.** The

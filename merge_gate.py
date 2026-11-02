@@ -106,14 +106,17 @@ def sh_strict(*args):
 
     Returns stdout on success and None when GitHub genuinely answered 404 --
     an unprotected branch really does 404, and that is a fact worth acting on.
-    Anything else raises, because the absence of an answer must never be
-    rendered as one.
+    A 403 that names the plan is the same fact: a private repo on a free plan
+    cannot have branch protection, so GitHub has answered and the answer will
+    not change on retry. Anything else raises, because the absence of an
+    answer must never be rendered as one.
     """
     code, out, err = sh(*args)
     if code == 0:
         return out
     low = err.lower()
-    if "404" in low or "not found" in low or "not protected" in low:
+    if ("404" in low or "not found" in low or "not protected" in low
+            or "upgrade to github pro" in low):
         return None
     raise ReadFailed(err.splitlines()[0][:120] if err else
                      f"gh {' '.join(args)} exited {code}")

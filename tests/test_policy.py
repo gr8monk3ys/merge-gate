@@ -254,6 +254,19 @@ def test_sh_strict_separates_no_from_silence(monkeypatch):
         mg.sh_strict("api", "x")
 
 
+def test_a_plan_gated_403_is_an_answer_and_other_403s_are_not(monkeypatch):
+    # What a private repo on a free plan returns for branch protection. It was
+    # filed as NO VERDICT on every sweep, marking each one incomplete forever.
+    plan = ("gh: Upgrade to GitHub Pro or make this repository public to "
+            "enable this feature. (HTTP 403)")
+    monkeypatch.setattr(mg, "sh", lambda *a: (1, "", plan))
+    assert mg.sh_strict("api", "x") is None
+    assert mg.required_checks("o/r", "main") == []
+    monkeypatch.setattr(mg, "sh", lambda *a: (1, "", "HTTP 403: API rate limit exceeded"))
+    with pytest.raises(mg.ReadFailed):
+        mg.sh_strict("api", "x")
+
+
 # --- owners -----------------------------------------------------------------
 
 def test_owners_come_from_env_and_an_empty_fleet_is_refused(monkeypatch):
