@@ -419,3 +419,255 @@ def test_a_sweep_can_be_asked_not_to_record(monkeypatch):
     monkeypatch.setattr(mg, "changed_paths", lambda *a: ["src/x.py"])
     mg._evaluate(_bot_pr(), "o/r", 7, {}, mg.Sweep(record=False))
     assert ledger.read() == ([], 0)
+
+
+# --- item 4: circuit breakers ----------------------------------------------
+
+import datetime as _dt  # noqa: E402
+
+_NOW = _dt.datetime(2026, 11, 15, 12, 0, tzinfo=_dt.timezone.utc)
+
+
+def _merged_row(repo="o/r", pr=1, hours_ago=1, sha="a" * 40, head="b" * 40,
+                dry_run=False, decision="MERGED"):
+    return {"event": "verdict", "repo": repo, "pr": pr, "decision": decision,
+            "dry_run": dry_run, "base_ref": "main", "merge_commit_sha": sha,
+            "head_sha": head,
+            "ts": ledger.now_iso(_NOW - _dt.timedelta(hours=hours_ago))}
+
+
+def _green_real_run(monkeypatch, cfg=None, base_runs=None):
+    """A green, allowlisted dependabot PR in a real run; returns the writes."""
+    writes = []
+    monkeypatch.setattr(mg, "sh_strict", _gh(_repo(["ci"], [_run("ci", "success")],
+                                                   base_runs=base_runs)))
+    monkeypatch.setattr(mg, "changed_paths", lambda *a: ["uv.lock"])
+    monkeypatch.setattr(mg, "DRY_RUN", False)
+    monkeypatch.setattr(mg, "sh", lambda *a: writes.append(a) or (0, "", ""))
+    cache = mg.RepoCache({"r": cfg or {}})
+    return writes, cache
+
+
+def _merges(writes):
+    return [w for w in writes if w[:2] == ("pr", "merge") and "--disable-auto" not in w]
+
+
+def test_a_paused_repo_is_never_merged(monkeypatch):
+    writes, cache = _green_real_run(monkeypatch, {"merge_gate_paused": True})
+    s = mg.Sweep()
+    mg._evaluate(_bot_pr(), "o/r", 7, {}, s, cache)
+    assert s.armed == [] and _merges(writes) == []
+    [(_, _, why, _)] = s.held
+    assert why.startswith(mg.HELD) and "merge_gate_paused" in why
+    assert _rows()[-1]["decision"] == "HELD"
+
+
+def test_a_paused_repo_is_never_armed_and_a_standing_arm_is_retired(monkeypatch):
+    writes, cache = _green_real_run(monkeypatch, {"merge_gate_paused": True})
+    monkeypatch.setattr(mg, "sh_strict", _gh(
+        [(".auto_merge != null", "true\nh7\nmain\nbase0\n")]
+        + _repo(["ci"], [_run("ci", "success")])))
+    s = mg.Sweep()
+    mg._evaluate(_bot_pr(), "o/r", 7, {}, s, cache)
+    assert _merges(writes) == []
+    assert ("pr", "merge", "7", "--repo", "o/r", "--disable-auto") in writes
+    assert not any("--auto" in w for w in writes)
+    assert len(s.held) == 1
+
+
+def test_a_paused_repo_is_held_in_a_dry_run_too(monkeypatch):
+    writes, cache = _green_real_run(monkeypatch, {"merge_gate_paused": True})
+    monkeypatch.setattr(mg, "DRY_RUN", True)
+    s = mg.Sweep()
+    mg._evaluate(_bot_pr(), "o/r", 7, {}, s, cache)
+    assert s.armed == [] and len(s.held) == 1 and writes == []
+
+
+def test_the_daily_cap_counts_real_merges_from_the_ledger(monkeypatch):
+    for i in range(3):
+        ledger.append(_merged_row(pr=i, hours_ago=0))
+    writes, cache = _green_real_run(monkeypatch)
+    s = mg.Sweep()
+    mg._evaluate(_bot_pr(), "o/r", 7, {}, s, cache)
+    assert _merges(writes) == [] and s.armed == []
+    assert "merge rate: 3" in s.held[0][2] and "limit 3" in s.held[0][2]
+
+
+def test_the_cap_ignores_dry_runs_other_repos_and_old_merges(monkeypatch):
+    ledger.append(_merged_row(decision="WOULD_MERGE", dry_run=True, hours_ago=0))
+    ledger.append(_merged_row(repo="o/other", hours_ago=0))
+    ledger.append(_merged_row(hours_ago=0))
+    ledger.append(_merged_row(hours_ago=0))
+    rows = ledger.read()[0]
+    rows[-1]["ts"] = rows[-2]["ts"] = "2026-01-01T00:00:00Z"   # long ago
+    s = mg.Sweep()
+    s.history = rows
+    st = mg.State("o/r", 7, "h7", "main", "base0", "false", "clean")
+    assert mg.breaker_reason(st, s, now=_NOW) is None
+
+
+def test_the_cap_is_overridable_per_repo_and_by_env(monkeypatch):
+    s = mg.Sweep()
+    s.history = [_merged_row(hours_ago=1)]
+    st = mg.State("o/r", 7, "h7", "main", "base0", "false", "clean",
+                  {"merge_gate_max_per_day": 1})
+    assert "limit 1" in mg.breaker_reason(st, s, now=_NOW)
+    st = mg.State("o/r", 7, "h7", "main", "base0", "false", "clean")
+    monkeypatch.setenv("MERGE_GATE_MAX_PER_DAY", "1")
+    assert "limit 1" in mg.breaker_reason(st, s, now=_NOW)
+    monkeypatch.setenv("MERGE_GATE_MAX_PER_DAY", "5")
+    assert mg.breaker_reason(st, s, now=_NOW) is None
+    # Repo config beats env; nonsense falls back to the default, not unlimited.
+    assert mg.max_per_day({"merge_gate_max_per_day": 2}) == 2
+    monkeypatch.setenv("MERGE_GATE_MAX_PER_DAY", "lots")
+    assert mg.max_per_day({}) == mg.DEFAULT_MAX_PER_DAY
+
+
+def test_this_sweeps_own_merges_count_toward_the_cap(monkeypatch):
+    s = mg.Sweep()
+    s.history = [_merged_row(hours_ago=1), _merged_row(hours_ago=2)]
+    s.armed.append(("o/r", 3, "lockfile-only; green", "t"))
+    st = mg.State("o/r", 7, "h7", "main", "base0", "false", "clean")
+    assert "merge rate: 3" in mg.breaker_reason(st, s, now=_NOW)
+
+
+def test_a_red_base_holds_a_green_pr(monkeypatch):
+    writes, cache = _green_real_run(
+        monkeypatch, base_runs=[_run("test", "failure"), _run("CodeQL", "success")])
+    s = mg.Sweep()
+    mg._evaluate(_bot_pr(), "o/r", 7, {}, s, cache)
+    assert _merges(writes) == []
+    assert s.held[0][2] == f"{mg.HELD} — main is red at base0: test"
+
+
+def test_a_red_non_correctness_check_on_base_does_not_hold(monkeypatch):
+    writes, cache = _green_real_run(
+        monkeypatch, base_runs=[_run("CodeQL", "failure"), _run("build", "success"),
+                                _run("test", "cancelled")])
+    s = mg.Sweep()
+    mg._evaluate(_bot_pr(), "o/r", 7, {}, s, cache)
+    assert len(_merges(writes)) == 1 and s.held == []
+
+
+def test_a_base_fixed_by_a_rerun_is_not_red(monkeypatch):
+    base_runs = [_run("test", "failure", id=1, done="2026-11-01T00:00:00Z"),
+                 _run("test", "success", id=2, done="2026-11-02T00:00:00Z")]
+    writes, cache = _green_real_run(monkeypatch, base_runs=base_runs)
+    s = mg.Sweep()
+    mg._evaluate(_bot_pr(), "o/r", 7, {}, s, cache)
+    assert len(_merges(writes)) == 1
+
+
+def _commits(*pairs):
+    return lambda repo, branch, since: list(pairs)
+
+
+def test_a_revert_of_a_gate_merge_is_detected_by_sha():
+    rows = [_merged_row(pr=4, sha="abcdef1234567890" + "0" * 24)]
+    pauses, unscanned = mg.detect_reverts(rows, now=_NOW, read=_commits(
+        ("r3v3rt" + "0" * 34, 'Revert "bump x"\n\nThis reverts commit abcdef1234567.'),
+        ("other" + "0" * 35, "fix: unrelated")))
+    assert unscanned == set()
+    [p] = pauses
+    assert (p["event"], p["repo"], p["pr"]) == ("pause", "o/r", 4)
+    assert p["revert_sha"].startswith("r3v3rt")
+
+
+def test_a_github_revert_pr_is_detected_by_pr_number():
+    rows = [_merged_row(pr=12)]
+    pauses, _ = mg.detect_reverts(rows, now=_NOW, read=_commits(
+        ("c" * 40, 'Revert "bump x (#12)" (#13)\n\nReverts o/r#12')))
+    assert [p["pr"] for p in pauses] == [12]
+
+
+def test_unrelated_reverts_and_other_repos_prs_do_not_pause():
+    rows = [_merged_row(pr=12, sha="a" * 40)]
+    pauses, _ = mg.detect_reverts(rows, now=_NOW, read=_commits(
+        ("c" * 40, "This reverts commit 1234567890abcdef."),
+        ("d" * 40, "Reverts o/other#12")))
+    assert pauses == []
+
+
+def test_a_revert_already_recorded_is_not_recorded_again():
+    rows = [_merged_row(pr=12), {"event": "pause", "repo": "o/r", "revert_sha": "c" * 40}]
+    pauses, _ = mg.detect_reverts(rows, now=_NOW, read=_commits(
+        ("c" * 40, "Reverts o/r#12")))
+    assert pauses == []
+
+
+def test_only_real_recent_merges_are_scanned():
+    reads = []
+    rows = [_merged_row(dry_run=True, decision="WOULD_MERGE"),
+            _merged_row(hours_ago=24 * 30)]
+    mg.detect_reverts(rows, now=_NOW, read=lambda *a: reads.append(a) or [])
+    assert reads == []
+
+
+def test_an_unscannable_repo_is_reported_and_its_merges_held():
+    def fail(*a):
+        raise mg.ReadFailed("tls blip")
+    pauses, unscanned = mg.detect_reverts([_merged_row()], now=_NOW, read=fail)
+    assert pauses == [] and unscanned == {"o/r"}
+    s = mg.Sweep()
+    s.history, s.unscanned = [], {"o/r"}
+    st = mg.State("o/r", 7, "h7", "main", "base0", "false", "clean")
+    assert "could not scan" in mg.breaker_reason(st, s, now=_NOW)
+
+
+def test_a_revert_pause_holds_until_its_sha_is_acknowledged(monkeypatch):
+    revert = "c0ffee" + "0" * 34
+    ledger.append({"event": "pause", "repo": "o/r", "base_ref": "main",
+                   "revert_sha": revert, "pr": 4, "reverted_sha": "a" * 40})
+    writes, cache = _green_real_run(monkeypatch)
+    s = mg.Sweep()
+    mg._evaluate(_bot_pr(), "o/r", 7, {}, s, cache)
+    assert _merges(writes) == []
+    why = s.held[0][2]
+    assert "PAUSED" in why and "c0ffee000000" in why and "merge_gate_ack_reverts" in why
+
+    # Time passing and later sweeps finding nothing new do not clear it...
+    st = mg.State("o/r", 7, "h7", "main", "base0", "false", "clean")
+    s2 = mg.Sweep()
+    assert "PAUSED" in mg.breaker_reason(st, s2, now=_NOW + _dt.timedelta(days=90))
+    # ...an unrelated ack does not clear it...
+    st = mg.State("o/r", 7, "h7", "main", "base0", "false", "clean",
+                  {"merge_gate_ack_reverts": ["deadbeef"]})
+    assert "PAUSED" in mg.breaker_reason(st, s2, now=_NOW)
+    # ...only acknowledging that revert's sha (a prefix will do) clears it.
+    writes, cache = _green_real_run(monkeypatch, {"merge_gate_ack_reverts": ["c0ffee0"]})
+    s3 = mg.Sweep()
+    mg._evaluate(_bot_pr(), "o/r", 7, {}, s3, cache)
+    assert len(_merges(writes)) == 1 and s3.held == []
+
+
+def test_the_sweep_scans_for_reverts_before_deciding_and_records_the_pause(monkeypatch):
+    ledger.append(_merged_row(pr=4, hours_ago=1))
+    monkeypatch.setattr(mg, "branch_commits",
+                        lambda repo, branch, since: [("c" * 40, "Reverts o/r#4")])
+    monkeypatch.setattr(mg, "detect_reverts",
+                        lambda rows, now=None, read=None, _d=mg.detect_reverts:
+                        _d(rows, now=now, read=mg.branch_commits))
+    writes, _ = _green_real_run(monkeypatch)
+    monkeypatch.setattr(mg, "load_data_dirs", lambda: {})
+    monkeypatch.setattr(mg, "load_gate_config", lambda: {})
+    monkeypatch.setattr(mg, "is_loop_produced", lambda repo, num, pr: True)
+    monkeypatch.setattr(mg, "enumerate_open_prs",
+                        lambda deadline=None, clock=None, workers=None:
+                        _enum([dict(_bot_pr(), repository={"nameWithOwner": "o/r"})]))
+    s = mg.sweep()
+    assert _merges(writes) == [] and len(s.held) == 1
+    assert [r["event"] for r in _rows()] == ["verdict", "pause", "verdict"]
+    assert _rows()[-1]["decision"] == "HELD"
+
+
+def test_branch_commits_reads_every_page(monkeypatch):
+    seen = []
+
+    def fake(*args):
+        seen.append(args)
+        return (json.dumps([{"sha": "a" * 40, "commit": {"message": "x\n\ny"}}])
+                + json.dumps([{"sha": "b" * 40, "commit": {"message": "z"}}]))
+    monkeypatch.setattr(mg, "sh_strict", fake)
+    assert mg.branch_commits("o/r", "main", "2026-11-01T00:00:00Z") == [
+        ("a" * 40, "x\n\ny"), ("b" * 40, "z")]
+    assert "--paginate" in seen[0] and "since=2026-11-01T00:00:00Z" in seen[0][1]

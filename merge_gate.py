@@ -38,6 +38,7 @@ public repos first spends nothing.
 import datetime as dt
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -81,6 +82,20 @@ STALE_BASE = "STALE BASE"
 # not "deliberately ungated" -- it is a Phase 1 setting that no longer
 # matches the repo, and it needs a person to fix the setting or the gate.
 DRIFT = "DRIFT"
+# Prefix of every circuit-breaker hold. A held PR is green and allowlisted;
+# something about the REPO says not now (see breaker_reason).
+HELD = "HELD"
+# Gate merges allowed per repo per rolling 24h, unless MERGE_GATE_MAX_PER_DAY
+# or the repo's merge_gate_max_per_day says otherwise.
+DEFAULT_MAX_PER_DAY = 3
+# How far back revert detection looks for gate merges to protect.
+REVERT_LOOKBACK_DAYS = 14
+# Base-branch conclusions that mean "main is broken". `cancelled` is not one:
+# concurrency groups cancel superseded runs on main all day, and the newest
+# run of the same name is what is read anyway.
+BASE_RED = {"failure", "timed_out", "action_required", "startup_failure"}
+_RE_REVERTS_SHA = re.compile(r"This reverts commit ([0-9a-f]{7,40})", re.I)
+_RE_REVERTS_PR = re.compile(r"\bReverts ([\w.-]+/[\w.-]+)#(\d+)")
 REBASE_NAG_HOURS = 24  # at most one @dependabot rebase request per PR per day
 
 
@@ -341,7 +356,7 @@ class State:
         self.sha, self.base, self.base_sha = sha, base, base_sha
         self.draft = draft.strip().lower() == "true"
         self.conflict = is_conflict(mstate)
-        cfg = cfg or {}
+        cfg = self.cfg = cfg or {}
         self.may_skip = list(cfg.get("may_skip") or [])
         self.declared = list(cfg.get("correctness_checks") or [])
         self.allow_auto: bool | None = None       # repo permits auto-merge
@@ -353,6 +368,7 @@ class State:
         self.green_by_skip = False                # a may_skip check passed as skipped
         self.checks: list = []                    # [{name, conclusion, app}] per required
         self.branch_head: str | None = None       # where base was when read
+        self.base_red: list = []                  # correctness checks red on base
 
     @property
     def correctness(self):
@@ -457,6 +473,19 @@ def read_state(repo, number, cache=None, stop=None, cfg=None):
     bail_if(stop)
     st.branch_head = cache.get(("base_head", repo, base),
                                lambda: base_head(repo, base))
+
+    # Is the base itself broken? Merging onto a red main stacks a change on
+    # a failure nobody has diagnosed, and a green PR proves nothing there:
+    # its checks ran against a base that already did not work. Every
+    # correctness check on the base head counts, required or not. Cached per
+    # base head, so a repo's base is read once however many PRs sit on it.
+    bail_if(stop)
+    runs = cache.get(("base_runs", repo, st.branch_head),
+                     lambda: check_runs(repo, st.branch_head))
+    st.base_red = sorted(
+        name for name, run in latest_by_name(runs).items()
+        if run.get("conclusion") in BASE_RED
+        and is_correctness_check(name, st.declared))
     return st
 
 
@@ -565,6 +594,14 @@ class Sweep:
         self.armed, self.review, self.skipped = [], [], []
         self.stale, self.failed = [], []
         self.drift = []      # auto-merge on, no correctness gate: see DRIFT
+        self.held = []       # green, but a circuit breaker said not now
+        # The merge ledger as read at the start of the sweep, plus any pause
+        # rows this sweep's revert scan added. Read lazily for callers that
+        # judge single PRs. This sweep's own merges are counted from `armed`.
+        self.history = None
+        # Repos whose revert scan GitHub did not answer: merges there are
+        # held, because "could not check for a revert" is not "no revert".
+        self.unscanned = set()
         # Whether verdicts are appended to the merge ledger. sweep(record=False)
         # lets a read-only consumer (a dashboard) ask without writing.
         self.record = record
@@ -591,7 +628,12 @@ class Sweep:
         """Rows that state a decision. `failed` is not one: it says GitHub
         did not answer, which is the absence of a verdict, not a verdict."""
         return (len(self.armed) + len(self.stale) + len(self.review)
-                + len(self.skipped) + len(self.drift))
+                + len(self.skipped) + len(self.drift) + len(self.held))
+
+    def rows(self):
+        if self.history is None:
+            self.history = ledger.read()[0]
+        return self.history
 
 
 class Reading:
@@ -672,6 +714,154 @@ def _read(pr, repo, num, data_dirs, cache=None, stop=None):
     if r.mergeable:
         r.state = read_state(repo, num, cache, stop)
     return r
+
+
+def max_per_day(cfg):
+    """The repo's rolling-24h gate-merge cap: repos.yml, else env, else 3.
+    An unreadable value falls back to the default, never to "unlimited"."""
+    for raw in ((cfg or {}).get("merge_gate_max_per_day"),
+                os.environ.get("MERGE_GATE_MAX_PER_DAY", "").strip() or None):
+        if raw is None:
+            continue
+        try:
+            return max(0, int(raw))
+        except (TypeError, ValueError):
+            return DEFAULT_MAX_PER_DAY
+    return DEFAULT_MAX_PER_DAY
+
+
+def _sha_match(a, b):
+    a, b = (a or "").lower(), (b or "").lower()
+    return len(a) >= 7 and len(b) >= 7 and (a.startswith(b) or b.startswith(a))
+
+
+def active_pauses(rows, repo, acked=()):
+    """Revert pauses for `repo` that no human has acknowledged. A pause
+    clears only when its revert sha is listed in merge_gate_ack_reverts:
+    a later sweep finding nothing new does not clear it, and neither does
+    time."""
+    return [p for p in ledger.pauses(rows, repo)
+            if not any(_sha_match(p.get("revert_sha"), a) for a in acked or ())]
+
+
+def breaker_reason(st, s, now=None):
+    """Why a green, allowlisted PR must still not merge now, or None.
+
+    Every reason starts with HELD. Checked in order of how much a human
+    must do: a pause needs repos.yml edited, a rate hold clears with time,
+    a red base clears when the base is fixed. Applied in DRY_RUN too, so a
+    report describes the run a real one would perform.
+    """
+    now = now or dt.datetime.now(dt.timezone.utc)
+    repo, cfg = st.repo, st.cfg or {}
+    if cfg.get("merge_gate_paused"):
+        return f"{HELD} — PAUSED by repos.yml (merge_gate_paused: true)"
+    rows = s.rows()
+    paused = active_pauses(rows, repo, cfg.get("merge_gate_ack_reverts"))
+    if paused:
+        p = paused[-1]
+        return (f"{HELD} — PAUSED: {p.get('revert_sha', '?')[:12]} on "
+                f"{p.get('base_ref') or st.base} reverts gate merge "
+                f"{(p.get('reverted_sha') or '?')[:12]} (#{p.get('pr')}); add "
+                f"{p.get('revert_sha', '?')[:12]} to merge_gate_ack_reverts in "
+                "repos.yml to resume")
+    if repo in s.unscanned:
+        return (f"{HELD} — could not scan {st.base} for reverts of gate merges "
+                "this sweep (GitHub did not answer)")
+    limit = max_per_day(cfg)
+    since = now - dt.timedelta(hours=24)
+    done = (len(ledger.real_merges(rows, repo, since=since))
+            + sum(1 for row in s.armed if row[0] == repo))
+    if done >= limit:
+        return (f"{HELD} — merge rate: {done} gate merge(s) in {repo} in the "
+                f"last 24h, limit {limit}")
+    if st.base_red:
+        return (f"{HELD} — {st.base} is red at {(st.branch_head or '?')[:8]}: "
+                f"{', '.join(st.base_red)}")
+    if s.ledger_errors and not DRY_RUN:
+        return f"{HELD} — the merge ledger stopped accepting writes this sweep"
+    return None
+
+
+def _parse_pages(out):
+    """Concatenated JSON documents (gh --paginate output) as a list of them."""
+    dec, i, docs = json.JSONDecoder(), 0, []
+    out = out or ""
+    while True:
+        while i < len(out) and out[i].isspace():
+            i += 1
+        if i >= len(out):
+            return docs
+        doc, i = dec.raw_decode(out, i)
+        docs.append(doc)
+
+
+def branch_commits(repo, branch, since):
+    """[(sha, message)] on `branch` since an ISO time. Raises ReadFailed."""
+    out = sh_strict("api", f"repos/{repo}/commits?sha={branch}&since={since}"
+                           "&per_page=100", "--paginate")
+    if out is None:
+        raise ReadFailed(f"{repo}: branch {branch} not found")
+    try:
+        pages = _parse_pages(out)
+    except json.JSONDecodeError:
+        raise ReadFailed(f"{repo}: unparseable commit list for {branch}")
+    commits = []
+    for page in pages:
+        for c in page if isinstance(page, list) else []:
+            commits.append((c.get("sha") or "",
+                            ((c.get("commit") or {}).get("message") or "")))
+    return commits
+
+
+def detect_reverts(rows, now=None, read=branch_commits):
+    """Scan each base branch the gate merged into for reverts of its merges.
+
+    Returns (new pause rows, repos that could not be scanned). A revert is
+    recognised by git's own "This reverts commit <sha>" naming a gate merge
+    (its merge commit or judged head), or by GitHub's revert-PR body
+    "Reverts owner/repo#N" naming a gate-merged PR. A revert already
+    recorded is not recorded again. Only real merges are protected; a
+    dry run merged nothing. The sweep calls this before deciding anything.
+    """
+    now = now or dt.datetime.now(dt.timezone.utc)
+    since = now - dt.timedelta(days=REVERT_LOOKBACK_DAYS)
+    merges = ledger.real_merges(rows, since=since)
+    seen = {(p.get("repo"), p.get("revert_sha")) for p in ledger.pauses(rows)}
+    targets = {}
+    for m in merges:
+        if m.get("repo") and m.get("base_ref"):
+            targets.setdefault((m["repo"], m["base_ref"]), []).append(m)
+    found, unscanned = [], set()
+    for (repo, base_ref), ms in sorted(targets.items()):
+        first = min(m.get("ts") or ledger.now_iso(since) for m in ms)
+        try:
+            commits = read(repo, base_ref, first)
+        except ReadFailed:
+            unscanned.add(repo)
+            continue
+        for sha, msg in commits:
+            if (repo, sha) in seen:
+                continue
+            shas = _RE_REVERTS_SHA.findall(msg)
+            prs = {int(n) for r, n in _RE_REVERTS_PR.findall(msg)
+                   if r.lower() == repo.lower()}
+            hit = next((m for m in ms
+                        if m.get("pr") in prs
+                        or any(_sha_match(s_, m.get("merge_commit_sha"))
+                               or _sha_match(s_, m.get("head_sha")) for s_ in shas)),
+                       None)
+            if hit is None:
+                continue
+            seen.add((repo, sha))
+            found.append({
+                "event": "pause", "repo": repo, "base_ref": base_ref,
+                "revert_sha": sha, "pr": hit.get("pr"),
+                "reverted_sha": hit.get("merge_commit_sha") or hit.get("head_sha"),
+                "reason": (f"{sha[:12]} on {base_ref} reverts gate merge of "
+                           f"#{hit.get('pr')}"),
+            })
+    return found, unscanned
 
 
 def pr_source(pr):
@@ -785,6 +975,12 @@ def _decide(r, s):
             _file(s, "skipped", r, detail, ledger.SKIPPED)
         return
 
+    if green:
+        held = breaker_reason(st, s)
+        if held:
+            _file(s, "held", r, held, ledger.HELD)
+            return
+
     if green and not DRY_RUN:
         # The base head in `st` was read once per repo, possibly minutes ago
         # and before other PRs in this very sweep were read. Caching it is
@@ -895,6 +1091,14 @@ def sweep(deadline=None, clock=time.monotonic, workers=None, record=True):
     s = Sweep(record=record)
     workers = workers or DEFAULT_WORKERS
 
+    # Before anything is decided: has any gate merge been reverted? A pause
+    # found now must hold this very sweep's merges in that repo.
+    rows = s.rows()
+    pauses, s.unscanned = detect_reverts(rows)
+    for p in pauses:
+        rows.append(p)
+        _record(s, p)
+
     e = enumerate_open_prs(deadline=deadline, clock=clock, workers=workers)
     s.repos_total = len(e.repos)
     s.repos_unreached = len(e.unreached)
@@ -969,6 +1173,8 @@ def main():
     # Not labelled on the PR: drift is a fact about the repo's settings, and
     # every PR in it would carry the same label for the same reason.
     dump("DRIFT (auto-merge on, no correctness gate — fix the repo)", s.drift)
+    dump("HELD by circuit breaker (green; repo paused, rate-limited or base red)",
+         s.held)
     if s.failed:
         dump("NO VERDICT — GitHub did not answer (retry; not a finding)", s.failed)
 
@@ -977,7 +1183,7 @@ def main():
             sh("pr", "edit", str(num), "--repo", repo, "--add-label", NEEDS_REVIEW)
 
     print(f"merged={len(s.armed)} stale={len(s.stale)} review={len(s.review)} "
-          f"skipped={len(s.skipped)} drift={len(s.drift)} "
+          f"skipped={len(s.skipped)} drift={len(s.drift)} held={len(s.held)} "
           f"no_verdict={len(s.failed)}")
     if s.failed:
         # Loud, because a partial sweep that looks complete is how a drained
