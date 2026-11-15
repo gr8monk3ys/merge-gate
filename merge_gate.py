@@ -1173,12 +1173,14 @@ def evidence_reason(head, base, full=True, new_tests=None):
 
 
 def _growth(h, b):
-    """How many tests a stage gained: new unique IDs when both sides list
-    them (IDs may be fewer than passes), else the rise in `tests`."""
+    """How many tests a stage gained: the rise in `tests`, capped by the new
+    unique IDs when both sides list them -- IDs may be fewer than passes, so
+    neither measure alone tells a new test from a renamed or rerun one."""
     if b is None:
         return len(h["passed_ids"]) if "passed_ids" in h else h["tests"]
     if "passed_ids" in h and "passed_ids" in b:
-        return len(set(h["passed_ids"]) - set(b["passed_ids"]))
+        return min(len(set(h["passed_ids"]) - set(b["passed_ids"])),
+                   h["tests"] - b["tests"])
     return h["tests"] - b["tests"]
 
 
