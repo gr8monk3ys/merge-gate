@@ -577,6 +577,15 @@ def parse_repos_yml(path=None):
             # not say -- all_repos()'s fallback then guesses the first
             # configured owner, same as everywhere else that guess is made.
             "owner": body.get("owner"),
+            # Gate trust settings (see load_gate_config). Every one of these
+            # can only make the gate STRICTER or name a human decision; an
+            # absent field is the strict default.
+            "may_skip": list(body.get("may_skip") or []),
+            "correctness_checks": list(body.get("correctness_checks") or []),
+            "merge_gate_max_per_day": body.get("merge_gate_max_per_day"),
+            "merge_gate_paused": bool(body.get("merge_gate_paused", False)),
+            "merge_gate_ack_reverts": [str(s) for s in
+                                       body.get("merge_gate_ack_reverts") or []],
         }
     return out
 
@@ -593,6 +602,81 @@ def load_data_dirs():
                 if e["data_dir"]}
     except (OSError, SystemExit):
         return {}
+
+
+GATE_CONFIG_FIELDS = ("may_skip", "correctness_checks", "merge_gate_max_per_day",
+                      "merge_gate_paused", "merge_gate_ack_reverts")
+
+
+def load_gate_config():
+    """Per-repo gate trust settings, {bare repo name: {field: value}}.
+
+      may_skip                required check names that may pass as `skipped`
+                              (a path-filtered job). Absent: a skipped
+                              required check is NOT green.
+      correctness_checks      check names a human asserts ARE correctness
+                              gates when their names do not say so -- the same
+                              field the control plane's is_correctness_check
+                              reads.
+      merge_gate_max_per_day  overrides MERGE_GATE_MAX_PER_DAY for this repo.
+      merge_gate_paused       true: hold every gate merge in this repo.
+      merge_gate_ack_reverts  revert commit SHAs a human has looked at. A
+                              pause raised by a detected revert clears only
+                              when its SHA is listed here.
+
+    Forgiving in the same way as load_data_dirs and for the same reason: a
+    missing file or missing PyYAML yields {}, and every field's absent value
+    is the strict one, so degrading can never loosen the gate.
+    """
+    try:
+        entries = parse_repos_yml()
+    except (OSError, SystemExit):
+        return {}
+    return {k: {f: e[f] for f in GATE_CONFIG_FIELDS} for k, e in entries.items()}
+
+
+# ---------------------------------------------------------------------------
+# Which check names count as a gate on the code still working.
+#
+# Kept in step with the control plane's `_fleet.is_correctness_check` (same
+# lists, same `declared` override). It is re-implemented here rather than
+# imported because the import would run the wrong way: `_fleet` imports this
+# module at load time, sets GATE_OWNERS and exits if it is unhappy, and does
+# not exist at all where the package runs standalone. The control plane can
+# import this one instead and keep a single definition.
+# ---------------------------------------------------------------------------
+
+NOT_CORRECTNESS = [
+    r"ci-tests-minimum",
+    r"codeql", r"semgrep", r"trivy", r"gitleaks", r"trufflehog", r"osv",
+    r"snyk", r"bandit", r"sast", r"secret", r"security", r"audit",
+    r"license", r"dependabot", r"dependency.review",
+    r"deploy", r"vercel", r"netlify", r"preview", r"lighthouse",
+    r"analyze", r"codecov", r"coverage.upload", r"comment", r"label",
+    r"summary", r"notify", r"release", r"publish",
+]
+
+CORRECTNESS = [
+    r"\btest", r"\bspec\b", r"build", r"lint", r"typecheck", r"type.check",
+    r"tsc\b", r"compile", r"quality", r"\bci\b", r"ci-tests", r"e2e",
+    r"pytest", r"jest", r"vitest", r"unit", r"integration", r"precommit",
+    r"pre-commit", r"validate", r"check",
+]
+
+
+def is_correctness_check(name, declared=None):
+    """Is this check a gate on the code still working?
+
+    An explicit per-repo declaration (`correctness_checks`) wins over both
+    lists. Otherwise deny beats allow: "Dependency Review / build" contains a
+    correctness word and is still not a gate.
+    """
+    if declared and name in declared:
+        return True
+    n = (name or "").lower()
+    if any(re.search(p, n) for p in NOT_CORRECTNESS):
+        return False
+    return any(re.search(p, n) for p in CORRECTNESS)
 
 
 _TRANSIENT = ("connection reset", "read tcp", "timeout", "eof",
