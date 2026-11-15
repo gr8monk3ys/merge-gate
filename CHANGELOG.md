@@ -3,6 +3,24 @@
 Releases before 0.9.0 are described by their commit and PR messages;
 `DECISIONS.md` tells why each rule exists.
 
+## 0.10.6 — a damaged artifact is refused, not raised
+
+### Fixed
+
+- **`parse_verify_report` returns a reason for every artifact it cannot
+  read.** A zip with the encrypted flag set, an unsupported compression
+  method, a corrupt deflate stream, or JSON nested too deep raised
+  `RuntimeError`, `NotImplementedError`, `zlib.error` or `RecursionError`.
+  The sweep only catches `ReadFailed`, so one such artifact, uploaded by a
+  PR's own CI run, stopped the sweep for every repo. Nothing merged on it.
+
+### Added
+
+- **Property tests for the classifier, the version rule, the tests-only
+  veto and the report parser** (`tests/test_gate_props.py`); they found the
+  bug above. CI's new `fuzz` job runs every property test with the `release`
+  profile: 5,000 random cases per property on each PR and push to `main`.
+
 ## 0.10.5 — growth needs both measures
 
 ### Security
