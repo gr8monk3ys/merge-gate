@@ -42,7 +42,7 @@ below get a veto.)
 |---|---|---|
 | `lockfile-only` | only regenerated lockfiles changed **and** every version delta inside is patch/minor | a major hiding in `uv.lock` |
 | `dependency-bump` | manifest + lockfile, every delta patch/minor (read from the PR body — the title of a group bump names no versions) | any group containing a major, a `0.x` minor, or a SHA-only bump |
-| `tests-only` | every file is a **brand-new** test file (status `added` in the compare of exactly the judged base...head), none is harness/config, none shares a name with an existing path, and none contains a skip/xfail/`.only`/`pytestmark`/`SkipTest`/`__test__` marker or a duplicate test name | one source file alongside forty tests — there is no partial credit; **any change to an existing test file** (modified, removed, renamed, copied) routes to a human |
+| `tests-only` | every file is a **brand-new** test file (status `added` in the compare of exactly the judged base...head), none is harness/config, none shares a name with an existing path, and none contains a skip/xfail/`.only`/`pytestmark`/`SkipTest`/`__test__` marker or a duplicate test name — **and** the repo opted in (`allow_tests_only`) **and** CI's test counts show more tests ran at head than at base (*Test-count evidence* below) | one source file alongside forty tests — there is no partial credit; **any change to an existing test file** (modified, removed, renamed, copied) routes to a human |
 | `data-artifact-only` | every path is inside a directory the repo has explicitly opted in via `data_dir` | anything, if the repo never opted in |
 | `ci-fix` | every added line matches an explicitly reviewed whitelist of action bumps | a workflow edit that merely *reads* like a fix |
 | `content` / `mixed` / `empty` / `unreadable` | — | always routed to a human |
@@ -69,6 +69,47 @@ ledger decision, never merged, applied in dry runs too — when:
   from the ledger plus this sweep's own merges;
 - any correctness check on the base branch's head is red (newest run per
   name; `cancelled` does not count).
+
+## Test-count evidence
+
+No scan of a new test file's text can prove it doesn't end the run early
+(`os._exit` reached through `__import__`, `importlib`, `setattr`, ...). A
+count of what ran can: if a new file stops the run, fewer tests pass. So a
+repo's CI uploads an Actions artifact named `verify-report` holding one file,
+`verify-report.json`:
+
+```json
+{"schema": 1, "repo": "owner/name", "commit": "<tested sha>",
+ "stages": [{"stage": "unit", "tests": 120, "passed": 118, "failed": 0, "skipped": 2}]}
+```
+
+from the workflow run for every PR head (`commit` = the PR head sha, not the
+`refs/pull/N/merge` sha) and every default-branch push (`commit` = the pushed
+sha). The gate reads the newest completed run on that `head_sha` that carries
+the artifact (for the base: a run of the base branch itself), downloads it,
+and validates it strictly — schema `1`, this repo, exactly this commit,
+stages non-empty and uniquely named, counts non-negative integers with
+`passed + failed + skipped == tests`. Anything else is *no evidence*, with
+the reason. Reports are read once per commit per sweep, and only for a PR
+whose required checks are already green.
+
+A **tests-only** PR (in a repo with `allow_tests_only: true`) merges only
+with evidence for both its head and the base its checks ran against, and
+only when: no test failed at head; every stage the base ran is present at
+head; per stage, `tests` and `passed` did not drop; and the total grew by at
+least the test cases the diff adds (`def test…` in Python, `it(`/`test(` in
+JS/TS) — or by at least one when they cannot be counted. Otherwise it routes
+with the reason, e.g. `VERIFY — stage e2e: tests 70 -> 64 at head`.
+
+`require_verify_evidence: true` in `repos.yml` applies the first two
+conditions (no failure at head, no vanished stage) to **every** shape the gate
+merges in that repo. Either way the head and base counts go into the ledger
+row's `artifacts.verify`.
+
+The report is written by the workflow that runs the code under test, so it is
+only as honest as the step that writes it: compute it from the runner's own
+result files (JUnit XML, `--json`) in a step after the tests, not from
+anything the tests themselves can write.
 
 ## Merge ledger
 
@@ -111,7 +152,7 @@ appending.
 ## Install
 
 ```sh
-pip install "merge-gate @ git+https://github.com/gr8monk3ys/merge-gate@v0.9.0"
+pip install "merge-gate @ git+https://github.com/gr8monk3ys/merge-gate@v0.10.0"
 ```
 
 That puts three console scripts on `PATH` — `merge-gate`, `ci-watchdog`,
@@ -185,7 +226,8 @@ Optional: `repos.yml` (see `repos.example.yml`), looked for at
 reads `data_dir` (opt-in data paths), `may_skip` (required checks that may
 pass as skipped), `correctness_checks` (check names that are gates despite
 their names), `merge_gate_max_per_day`, `merge_gate_paused` and
-`merge_gate_ack_reverts`. Every absent field is the strict value. The
+`merge_gate_ack_reverts`, `allow_tests_only` and `require_verify_evidence`.
+Every absent field is the strict value. The
 merge policy itself is constants at the top of `classify_pr.py`, and
 changing what merges is a one-line, deliberate edit.
 

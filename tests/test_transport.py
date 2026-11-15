@@ -318,3 +318,31 @@ def test_forced_gh_mode_never_reroutes(monkeypatch):
     r = gh_transport.run(["gh", "pr", "list", "--repo", "o/r"])
     assert calls == []
     assert r.returncode == 1
+
+
+def test_an_artifact_download_does_not_carry_the_token_past_the_redirect(monkeypatch):
+    """GitHub redirects an artifact zip to signed storage. The token is for
+    api.github.com; an unredirected header is never sent to the next host."""
+    seen = {}
+
+    class Resp:
+        def read(self):
+            return b"PK\x03\x04zip"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def fake(req, timeout=60):
+        seen["req"] = req
+        return Resp()
+    monkeypatch.setattr(gh_transport, "MODE", "rest")
+    monkeypatch.setattr(gh_transport, "token", lambda: "t")
+    monkeypatch.setattr(gh_transport.urllib.request, "urlopen", fake)
+    r = gh_transport.download("repos/o/r/actions/artifacts/5/zip")
+    assert r.returncode == 0 and r.stdout == b"PK\x03\x04zip"
+    req = seen["req"]
+    assert req.unredirected_hdrs.get("Authorization") == "Bearer t"
+    assert "Authorization" not in req.headers
