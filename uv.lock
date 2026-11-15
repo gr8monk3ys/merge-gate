@@ -22,7 +22,7 @@ wheels = [
 
 [[package]]
 name = "merge-gate"
-version = "0.10.1"
+version = "0.10.2"
 source = { editable = "." }
 
 [package.optional-dependencies]

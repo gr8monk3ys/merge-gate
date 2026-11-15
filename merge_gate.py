@@ -1153,6 +1153,9 @@ def evidence_reason(head, base, full=True, new_tests=None):
                 return f"stage {name}: {k} {b[k]} -> {h[k]} at head"
         if h["skipped"] > b["skipped"]:
             return f"stage {name}: skipped {b['skipped']} -> {h['skipped']} at head"
+        # Dropping the IDs at head must not switch the identity check off.
+        if "passed_ids" in b and "passed_ids" not in h:
+            return f"stage {name}: passed_ids at base but not at head"
         if "passed_ids" in h and "passed_ids" in b:
             gone = sorted(set(b["passed_ids"]) - set(h["passed_ids"]))
             if gone:

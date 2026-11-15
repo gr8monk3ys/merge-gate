@@ -3,6 +3,15 @@
 Releases before 0.9.0 are described by their commit and PR messages;
 `DECISIONS.md` tells why each rule exists.
 
+## 0.10.2 — no evidence downgrade
+
+### Fixed
+
+- **A head report without `passed_ids` no longer escapes the identity check.**
+  If a stage carries `passed_ids` at base but not at head, the PR routes
+  (`stage <name>: passed_ids at base but not at head`) instead of falling back
+  to the count rules.
+
 ## 0.10.1 — evidence provenance and test identity
 
 ### Security
