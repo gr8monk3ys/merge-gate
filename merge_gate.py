@@ -1136,7 +1136,8 @@ def evidence_reason(head, base, full=True, new_tests=None):
     head. `full` (tests-only) adds: per stage, tests and passed did not drop
     and skipped did not rise; where both sides list `passed_ids`, every ID
     that passed at base passed at head; and the total grew by at least the
-    cases the diff adds (`new_tests`), or -- when they could not be counted --
+    cases the diff adds (counted in new IDs where both sides list them, so a
+    test run twice is not a new test) (`new_tests`), or -- when they could not be counted --
     by at least one.
     """
     for name, c in sorted(head.items()):
@@ -1165,13 +1166,20 @@ def evidence_reason(head, base, full=True, new_tests=None):
     need = new_tests if new_tests else 1
     what = (f"the {new_tests} new test case(s) the diff adds" if new_tests
             else "at least one (new cases could not be counted)")
-    grew = (sum(c["tests"] for c in head.values())
-            - sum(c["tests"] for c in base.values()))
-    # With IDs this also bounds the new IDs: base IDs all pass at head, there
-    # is one ID per pass, and skipped/failed cannot rise, so new IDs >= grew.
+    grew = sum(_growth(head[n], base.get(n)) for n in head)
     if grew < need:
         return f"total tests grew by {grew}, need {what}"
     return None
+
+
+def _growth(h, b):
+    """How many tests a stage gained: new unique IDs when both sides list
+    them (IDs may be fewer than passes), else the rise in `tests`."""
+    if b is None:
+        return len(h["passed_ids"]) if "passed_ids" in h else h["tests"]
+    if "passed_ids" in h and "passed_ids" in b:
+        return len(set(h["passed_ids"]) - set(b["passed_ids"]))
+    return h["tests"] - b["tests"]
 
 
 def judge_evidence(repo, st, cache, full, new_tests=None):

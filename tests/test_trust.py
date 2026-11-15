@@ -982,6 +982,11 @@ def _i(ids):
     ({"u": _i(["a", "b", "x", "y"]), "v": _i(["e", "f"])},
      {"u": _i(["a", "b"]), "v": _i(["d", "e"])}, True, 2,
      "stage v: d passed at base but not at head"),
+    # IDs may be fewer than passes, so a test run twice is no new test.
+    ({"u": dict(_c(4), passed_ids=["a", "b"])}, {"u": _i(["a", "b"])}, True, None,
+     "total tests grew by 0, need at least one (new cases could not be counted)"),
+    ({"u": dict(_c(6), passed_ids=["a", "b", "x"])}, {"u": dict(_c(4), passed_ids=["a", "b"])},
+     True, 1, None),
     # IDs at base but not at head: no downgrade to the count rules.
     ({"u": _c(11)}, {"u": _i(["a", "b"])}, True, 1,
      "stage u: passed_ids at base but not at head"),
