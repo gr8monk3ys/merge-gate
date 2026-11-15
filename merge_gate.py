@@ -3,10 +3,18 @@
 
 Four conditions, ALL required, no overrides:
 
-  1. diff shape is on the allowlist and carries no content veto
-  2. the repo has >= 1 required status check on the base branch
-  3. every required check is currently green
+  1. diff shape is on the allowlist and carries no content veto (and a
+     tests-only diff does not weaken the tests)
+  2. the repo has >= 1 required status check on the base branch, and at
+     least one of them is a correctness gate (else: DRIFT)
+  3. every required check is currently green -- newest run per name,
+     `skipped` only where repos.yml `may_skip` allows it
   4. those checks ran against the base branch's CURRENT head
+
+Then the circuit breakers (breaker_reason) can still HOLD a green PR: a
+paused repo, an unacknowledged revert of a gate merge, the per-repo daily
+merge cap, or a red base. Every verdict is appended to the merge ledger
+(gate_ledger.py), which is where the cap and the revert history come from.
 
 Condition 2 is the one that was missing and is why dotfiles#41 merged with
 "no checks reported". A shape match on an ungated repo does NOT merge — it
@@ -664,6 +672,9 @@ class Reading:
         self.head_sha: str | None = None   # head when the arm was read
         self.base_ref: str | None = None
         self.base_sha: str | None = None
+        # The head whose patch was content-checked (tests-only). When set,
+        # it is the only head this PR may be merged at.
+        self.content_sha: str | None = None
 
 
 def _read(pr, repo, num, data_dirs, cache=None, stop=None):
@@ -703,8 +714,19 @@ def _read(pr, repo, num, data_dirs, cache=None, stop=None):
     # tests is a claim about content, so read the patch. Only for this shape:
     # it is the one whose risk lives in the lines rather than the files.
     if r.mergeable and r.shape == "tests-only":
+        # The patch must be the patch of the commit that gets merged. Head
+        # read before AND after the files read: equal means the files
+        # describe that commit. It is then pinned as `content_sha`, and the
+        # State's judged head -- the sha --match-head-commit merges -- must
+        # equal it, or nothing is decided this sweep.
         bail_if(stop)
+        before = pr_head_sha(repo, num)
         files = pr_files(repo, num)
+        after = pr_head_sha(repo, num)
+        if before != after:
+            raise ReadFailed(f"{repo}#{num}: head moved while its diff was read "
+                             f"({before[:8]} -> {after[:8]})")
+        r.content_sha = before
         if sorted(f.get("filename") or "" for f in files) != sorted(paths):
             # The PR moved between the two reads; judge it next sweep, whole.
             raise ReadFailed(f"{repo}#{num}: diff changed between reads")
@@ -728,6 +750,9 @@ def _read(pr, repo, num, data_dirs, cache=None, stop=None):
 
     if r.mergeable:
         r.state = read_state(repo, num, cache, stop)
+        if r.content_sha and r.state.sha != r.content_sha:
+            raise ReadFailed(f"{repo}#{num}: head moved after its diff was judged "
+                             f"({r.content_sha[:8]} -> {r.state.sha[:8]})")
     return r
 
 
@@ -877,6 +902,15 @@ def detect_reverts(rows, now=None, read=branch_commits):
                            f"#{hit.get('pr')}"),
             })
     return found, unscanned
+
+
+def pr_head_sha(repo, num):
+    """The PR's current head sha. Raises ReadFailed."""
+    out = sh_strict("api", f"repos/{repo}/pulls/{num}", "--jq", ".head.sha")
+    sha = (out or "").strip().splitlines()[:1]
+    if not sha or not sha[0]:
+        raise ReadFailed(f"{repo}#{num}: no head sha")
+    return sha[0].strip()
 
 
 def pr_files(repo, num):

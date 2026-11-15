@@ -517,10 +517,16 @@ def ci_fix_allowed(diff_text):
 # Added lines matching any of these switch a test off (or switch every other
 # test off). Named, so the reason says which rule fired.
 TEST_DISABLERS = [
-    ("@pytest.mark.skip/skipif/xfail", r"@pytest\.mark\.(skip|skipif|xfail)\b"),
+    # With or without the `@`, and with or without the `pytest.` prefix
+    # (`from pytest import mark`): `mark.skip` is the marker either way.
+    ("pytest mark.skip/skipif/xfail", r"\bmark\.(skip|skipif|xfail)\b"),
+    # A module-level `pytestmark = ...` applies a marker to every test in
+    # the file without a decorator anywhere.
+    ("pytestmark =", r"\bpytestmark\s*="),
     ("pytest.skip(/xfail(/importorskip(", r"\bpytest\.(skip|xfail|importorskip)\s*\("),
     ("xfail", r"\bxfail\b"),
-    ("unittest skip", r"@unittest\.(skip|skipIf|skipUnless|expectedFailure)\b"
+    ("unittest skip", r"\bunittest\.(skip|skipIf|skipUnless|expectedFailure)\b"
+                      r"|@(skip|skipIf|skipUnless|expectedFailure)\b"
                       r"|\bself\.skipTest\s*\("),
     ("it/describe/test.skip/.only/.todo",
      r"\b(it|describe|test|context|suite)\.(skip|only|todo)\b"),
@@ -531,8 +537,8 @@ TEST_DISABLERS = [
     ("#[ignore]", r"#\[ignore\]"),
 ]
 
-# One count per line. Deliberately broad: it is compared, removed vs added,
-# so a line it over-matches on both sides cancels out.
+# Used only to make a removal's reason specific. Removals are not netted
+# against additions: any removed line is a veto (see tests_only_veto).
 ASSERTION = re.compile(r"\bassert|\bexpect\s*\(|\.should\b|\bshould\.|"
                        r"\btoBe\w*\b|\btoEqual\b|\btoMatch\w*\b|\btoThrow\b")
 
@@ -563,7 +569,6 @@ def tests_only_veto(files):
         return "could not read the diff to check test content"
     if not files:
         return "the diff lists no files"
-    added_asserts = removed_asserts = 0
     for f in files:
         name = f.get("filename") or ""
         status = f.get("status") or ""
@@ -572,6 +577,12 @@ def tests_only_veto(files):
                 return f"touches test harness/config: {p}"
         if status == "removed":
             return f"deletes test file {name}"
+        # A rename can drop a file out of collection (test_x.py -> x.py,
+        # a.test.ts -> a.ts) and a copy can shadow one; either is a deletion
+        # in effect. Deny every one rather than model each runner's globs.
+        if status in ("renamed", "copied"):
+            return (f"{status} test file {f.get('previous_filename') or '?'} "
+                    f"-> {name}")
         patch = f.get("patch")
         if patch is None:
             return f"no readable patch for {name} (binary or too large to judge)"
@@ -582,12 +593,14 @@ def tests_only_veto(files):
                     if re.search(pat, body):
                         return (f"adds a test-disabling marker ({label}) in {name}: "
                                 f"{body.strip()[:80]}")
-                added_asserts += bool(ASSERTION.search(body))
-            elif line.startswith("-"):
-                removed_asserts += bool(ASSERTION.search(line[1:]))
-    if removed_asserts > added_asserts:
-        return (f"removes more assertions than it adds "
-                f"({removed_asserts} removed, {added_asserts} added)")
+            elif line.startswith("-") and line[1:].strip():
+                # Deny by default. Telling a harmless removal from a
+                # weakening one needs the test's meaning: an edited expected
+                # value, a dropped setup step and a deleted assertion all
+                # look alike here. A tests-only PR that only ADDS merges.
+                gone = line[1:].strip()[:80]
+                kind = "an assertion" if ASSERTION.search(line[1:]) else "a line"
+                return f"removes {kind} from existing test code in {name}: {gone}"
     return None
 
 
