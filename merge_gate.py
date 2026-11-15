@@ -44,6 +44,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import gate_ledger as ledger  # noqa: E402
 from classify_pr import (  # noqa: E402
     DEFAULT_WORKERS, Abandoned, _run_gh, auto_mergeable, bail_if, bump_kind,
     changed_paths, classify, conflict_self_heals, content_veto,
@@ -62,6 +63,12 @@ NEEDS_REVIEW = "needs-review"
 # green: a sweep that judged nothing and said so quietly is a sweep nobody
 # notices did not happen.
 EXIT_NO_VERDICTS = 3
+# Exit status when a real run (DRY_RUN=0) cannot write its merge ledger. The
+# rate and revert breakers are computed from that file; a gate that cannot
+# record its merges cannot count them, so it refuses to start.
+EXIT_NO_LEDGER = 4
+# How many changed paths a ledger row carries. The count is always exact.
+LEDGER_MAX_PATHS = 50
 # Prose for the report, but compared by code: this token links check_state's
 # conflict verdict to the self-heal in _evaluate. One definition, or a wording
 # tweak silently disables the rebase kick with no failure signal.
@@ -549,6 +556,8 @@ class Sweep:
         self.repos_total = 0
         self.repos_unreached = 0
         self.repos_unlisted = []
+        # Ledger appends that failed. Loud in the report; see _record().
+        self.ledger_errors = []
 
     @property
     def verdicts(self):
@@ -576,6 +585,14 @@ class Reading:
         self.why: str | None = None        # review reason, when not mergeable
         self.armed = False                 # GitHub has an arm on this PR
         self.state: State | None = None    # read when mergeable
+        self.paths: list | None = None     # changed paths; None = unreadable
+        self.source = pr_source(pr)        # dependabot | loop | other
+        # The PR's own bump severity (patch/minor/...), when it declares one.
+        # Recorded as the ledger's `tier`: how far the code moved.
+        self.tier: str | None = None
+        self.head_sha: str | None = None   # head when the arm was read
+        self.base_ref: str | None = None
+        self.base_sha: str | None = None
 
 
 def _read(pr, repo, num, data_dirs, cache=None, stop=None):
@@ -588,8 +605,9 @@ def _read(pr, repo, num, data_dirs, cache=None, stop=None):
     cache = cache if cache is not None else RepoCache()
     r = Reading(pr, repo, num)
     bail_if(stop)
-    paths = changed_paths(repo, num)
+    paths = r.paths = changed_paths(repo, num)
     title, body = r.title, pr.get("body", "") or ""
+    r.tier = bump_kind(title, body)
     # classify() reads paths only; the version judgement needs the PR text.
     r.shape = promote_candidate(
         classify(paths, data_dirs.get(repo.split("/")[1])), title, body)
@@ -614,13 +632,79 @@ def _read(pr, repo, num, data_dirs, cache=None, stop=None):
     # allowlist is drift to correct, and an arm on an allowlisted PR is a
     # standing permission to retire (see _decide).
     bail_if(stop)
+    # The same read carries the head and base the ledger records for PRs that
+    # never reach read_state(): every row names the commit it was about.
     out = sh_strict("api", f"repos/{repo}/pulls/{num}",
-                    "--jq", ".auto_merge != null")
-    r.armed = out is not None and out.strip() == "true"
+                    "--jq", ".auto_merge != null,.head.sha,.base.ref,.base.sha")
+    lines = (out or "").splitlines()
+    r.armed = bool(lines) and lines[0].strip() == "true"
+    if len(lines) >= 4:
+        r.head_sha, r.base_ref, r.base_sha = (x.strip() for x in lines[1:4])
 
     if r.mergeable:
         r.state = read_state(repo, num, cache, stop)
     return r
+
+
+def pr_source(pr):
+    """Who produced this PR: dependabot | loop | other. For the ledger;
+    the gate's own eligibility rule is is_loop_produced()."""
+    if is_dependabot(pr):
+        return "dependabot"
+    labels = [l.get("name") for l in pr.get("labels") or []]
+    if "automated" in labels or (pr.get("headRefName") or "").startswith("auto/"):
+        return "loop"
+    return "other"
+
+
+def ledger_row(r, decision, reason, merge_commit_sha=None):
+    """The one structured record of a verdict. Pure."""
+    st = getattr(r, "state", None)
+    paths = getattr(r, "paths", None)
+    pr = getattr(r, "pr", {}) or {}
+    return {
+        "event": "verdict",
+        "repo": r.repo, "pr": r.num, "title": getattr(r, "title", ""),
+        "source": getattr(r, "source", None) or pr_source(pr),
+        "shape": getattr(r, "shape", None),
+        "tier": getattr(r, "tier", None),
+        # What the PR is about: its judged head, and the base its checks saw.
+        "head_sha": st.sha if st else getattr(r, "head_sha", None),
+        "base_ref": st.base if st else getattr(r, "base_ref", None),
+        "base_sha": st.base_sha if st else getattr(r, "base_sha", None),
+        "checks": list(st.checks) if st else [],
+        "green_by_skip": bool(st.green_by_skip) if st else False,
+        "artifacts": {"count": None if paths is None else len(paths),
+                      "paths": (paths or [])[:LEDGER_MAX_PATHS]},
+        "decision": decision, "reason": reason,
+        "dry_run": DRY_RUN,
+        "merge_commit_sha": merge_commit_sha,
+    }
+
+
+def _record(s, row):
+    """Append a row; a failure is kept on the Sweep and reported, never
+    swallowed. The verdict itself has already been reached and stands."""
+    try:
+        ledger.append(row)
+    except ledger.LedgerError as exc:
+        s.ledger_errors.append(str(exc))
+
+
+def _file(s, bucket, r, detail, decision, merge_commit_sha=None):
+    """File one verdict row on the Sweep AND in the ledger. Every verdict
+    goes through here, so the two cannot disagree about what was decided."""
+    getattr(s, bucket).append((r.repo, r.num, detail, r.title))
+    _record(s, ledger_row(r, decision, detail, merge_commit_sha))
+
+
+def _merge_commit_sha(repo, num):
+    """The commit a merge put on the base, or None. Best-effort: the merge
+    has already happened, so a blipped read must not un-decide it. Revert
+    detection also matches the judged head and the PR number."""
+    code, out, _ = sh("api", f"repos/{repo}/pulls/{num}", "--jq", ".merge_commit_sha")
+    out = (out or "").strip()
+    return out if code == 0 and out and out != "null" else None
 
 
 def _disarm(repo, num):
@@ -648,7 +732,7 @@ def _decide(r, s):
         if r.armed:
             why += " — DISARMED (was armed outside the allowlist)"
             _disarm(repo, num)
-        s.review.append((repo, num, why, title))
+        _file(s, "review", r, why, ledger.ROUTED)
         return
 
     # Standing arms are retired, allowlisted shape or not. An arm outlives
@@ -665,7 +749,7 @@ def _decide(r, s):
     sha, base = st.sha, st.base
 
     if green is None:
-        s.skipped.append((repo, num, detail, title))
+        _file(s, "skipped", r, detail, ledger.SKIPPED)
         return
 
     if green and not DRY_RUN:
@@ -694,9 +778,9 @@ def _decide(r, s):
         if kick:
             detail += request_rebase(repo, num)
         if detail.startswith(STALE_BASE) and kick:
-            s.stale.append((repo, num, detail, title))
+            _file(s, "stale", r, detail, ledger.STALE)
         else:
-            s.review.append((repo, num, detail, title))
+            _file(s, "review", r, detail, ledger.ROUTED)
         return
 
     if not DRY_RUN:
@@ -708,9 +792,11 @@ def _decide(r, s):
         code, _, err = sh("pr", "merge", str(num), "--repo", repo,
                           "--squash", "--match-head-commit", sha)
         if code != 0:
-            s.skipped.append((repo, num, f"merge refused: {err[:60]}", title))
+            _file(s, "skipped", r, f"merge refused: {err[:60]}", ledger.SKIPPED)
             return
-    s.armed.append((repo, num, f"{r.shape}; {detail}", title))
+    _file(s, "armed", r, f"{r.shape}; {detail}",
+          ledger.WOULD_MERGE if DRY_RUN else ledger.MERGED,
+          None if DRY_RUN else _merge_commit_sha(repo, num))
     # This merge moved the base. Every candidate still to come on it was
     # judged -- by GitHub, when its checks ran -- against the base that no
     # longer exists. #145 landed 21 seconds after #148 that way.
@@ -816,11 +902,20 @@ def sweep(deadline=None, clock=time.monotonic, workers=None):
                 # No verdict was reached. Say exactly that, in its own
                 # section, rather than borrowing the wording of a decision.
                 s.failed.append((repo, num, str(exc), pr["title"]))
+                _record(s, ledger_row(Reading(pr, repo, num),
+                                      ledger.NO_VERDICT, str(exc)))
     return s
 
 
 def main():
     print(f"=== merge_gate :: {'REPORT ONLY' if DRY_RUN else 'APPLYING'} ===\n")
+    if not DRY_RUN:
+        try:
+            ledger.require_writable()
+        except ledger.LedgerError as exc:
+            print(f"⚠ {exc}\nRefusing to merge without a merge record. "
+                  f"Exit {EXIT_NO_LEDGER}.")
+            return EXIT_NO_LEDGER
     budget = os.environ.get("SWEEP_BUDGET_SECONDS", "").strip()
     deadline = (time.monotonic() + float(budget)) if budget else None
     s = sweep(deadline)
@@ -851,6 +946,9 @@ def main():
         # Loud, because a partial sweep that looks complete is how a drained
         # queue gets reported while a fifth of it was never examined.
         print(f"⚠ {len(s.failed)} PR(s) got NO verdict. This run is incomplete.")
+    if s.ledger_errors:
+        print(f"⚠ {len(s.ledger_errors)} ledger write(s) failed: "
+              f"{s.ledger_errors[0]}")
     if s.repos_unlisted:
         # Not "no PRs there": GitHub did not answer for these repos, so
         # their PRs are simply absent from this walk (§22).

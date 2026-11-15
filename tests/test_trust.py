@@ -171,3 +171,147 @@ def test_gate_config_is_read_from_repos_yml(tmp_path, monkeypatch):
 def test_a_missing_repos_yml_yields_no_gate_config(tmp_path, monkeypatch):
     monkeypatch.setenv("GATE_REPOS_YML", str(tmp_path / "nope.yml"))
     assert cp.load_gate_config() == {}
+
+
+# --- item 1: the ledger -----------------------------------------------------
+
+import gate_ledger as ledger  # noqa: E402
+
+
+def _bot_pr(num=7):
+    return {"number": num, "title": "bump x from 1.0.0 to 1.0.1", "body": "",
+            "author": {"login": "app/dependabot", "is_bot": True},
+            "labels": [], "headRefName": f"dependabot/npm_and_yarn/x-{num}"}
+
+
+def _rows():
+    rows, bad = ledger.read()
+    assert bad == 0
+    return rows
+
+
+def test_the_ledger_path_comes_from_the_environment_per_call(tmp_path, monkeypatch):
+    monkeypatch.setenv("MERGE_GATE_LEDGER", str(tmp_path / "x.jsonl"))
+    assert ledger.path() == str(tmp_path / "x.jsonl")
+    monkeypatch.delenv("MERGE_GATE_LEDGER")
+    assert ledger.path().endswith("/.local/state/fleet/merge-gate-ledger.jsonl")
+    monkeypatch.setenv("MERGE_GATE_LEDGER", "off")
+    assert ledger.path() is None and ledger.append({"x": 1}) is None
+
+
+def test_a_torn_line_is_counted_not_fatal(_isolated_ledger):
+    ledger.append({"event": "verdict", "decision": "ROUTED"})
+    with open(_isolated_ledger, "a") as f:
+        f.write('{"event": "verd')            # a run killed mid-write
+    rows, bad = ledger.read()
+    assert len(rows) == 1 and bad == 1
+
+
+def test_a_merged_dependabot_pr_is_recorded_with_its_evidence(monkeypatch):
+    runs = [_run("ci", "success", app="github-actions")]
+    monkeypatch.setattr(mg, "sh_strict", _gh(_repo(["ci"], runs)))
+    monkeypatch.setattr(mg, "changed_paths", lambda *a: ["uv.lock"])
+    monkeypatch.setattr(mg, "DRY_RUN", False)
+    monkeypatch.setattr(mg, "sh", lambda *a: (0, "m3rg3d" if ".merge_commit_sha" in a else "", ""))
+    s = mg.Sweep()
+    mg._evaluate(_bot_pr(), "o/r", 7, {}, s)
+    assert len(s.armed) == 1
+    [row] = _rows()
+    assert row["event"] == "verdict" and row["v"] == ledger.SCHEMA
+    assert (row["repo"], row["pr"], row["decision"]) == ("o/r", 7, "MERGED")
+    assert (row["head_sha"], row["base_ref"], row["base_sha"]) == ("h7", "main", "base0")
+    assert row["shape"] == "lockfile-only" and row["tier"] == "patch"
+    assert row["source"] == "dependabot"
+    assert row["checks"] == [{"name": "ci", "conclusion": "success",
+                              "app": "github-actions"}]
+    assert row["green_by_skip"] is False
+    assert row["artifacts"] == {"count": 1, "paths": ["uv.lock"]}
+    assert row["merge_commit_sha"] == "m3rg3d"
+    assert row["dry_run"] is False and row["reason"].startswith("lockfile-only; green")
+    assert row["ts"].endswith("Z")
+
+
+def test_a_dry_run_records_would_merge_and_reads_no_merge_commit(monkeypatch):
+    monkeypatch.setattr(mg, "sh_strict", _gh(_repo(["ci"], [_run("ci", "success")])))
+    monkeypatch.setattr(mg, "changed_paths", lambda *a: ["uv.lock"])
+    monkeypatch.setattr(mg, "DRY_RUN", True)
+    monkeypatch.setattr(mg, "sh", lambda *a: pytest.fail(f"wrote in a dry run: {a}"))
+    mg._evaluate(_bot_pr(), "o/r", 7, {}, mg.Sweep())
+    [row] = _rows()
+    assert row["decision"] == "WOULD_MERGE" and row["dry_run"] is True
+    assert row["merge_commit_sha"] is None
+    assert ledger.real_merges(_rows()) == []      # never counted as a merge
+
+
+def test_a_routed_pr_is_recorded_with_the_head_it_was_judged_at(monkeypatch):
+    monkeypatch.setattr(mg, "sh_strict", _gh([
+        (".auto_merge != null", "false\nh9\nmain\nbase0\n")]))
+    monkeypatch.setattr(mg, "changed_paths", lambda *a: ["src/x.py"])
+    pr = {"number": 9, "title": "feat: thing", "body": "", "labels": [],
+          "author": {"login": "bot"}, "headRefName": "auto/finish-20261101"}
+    s = mg.Sweep()
+    mg._evaluate(pr, "o/r", 9, {}, s)
+    [row] = _rows()
+    assert row["decision"] == "ROUTED" and row["reason"] == "shape=mixed"
+    assert row["source"] == "loop" and row["head_sha"] == "h9"
+    assert row["checks"] == [] and row["tier"] is None
+
+
+def test_a_skipped_pr_is_recorded(monkeypatch):
+    monkeypatch.setattr(mg, "sh_strict", _gh([
+        ("pulls/7 --jq .head.sha", "h7\nmain\nfalse\nclean\nbase0\n"),
+        (".auto_merge != null", "false"),
+        (".allow_auto_merge", "false")]))
+    monkeypatch.setattr(mg, "changed_paths", lambda *a: ["uv.lock"])
+    mg._evaluate(_bot_pr(), "o/r", 7, {}, mg.Sweep())
+    [row] = _rows()
+    assert row["decision"] == "SKIPPED" and "auto-merge disabled" in row["reason"]
+
+
+def test_an_unanswered_pr_is_recorded_as_no_verdict(monkeypatch):
+    def boom(pr, repo, num, dd, cache=None, stop=None):
+        raise mg.ReadFailed("tls blip")
+    monkeypatch.setattr(mg, "enumerate_open_prs",
+                        lambda deadline=None, clock=None, workers=None:
+                        _enum([dict(_bot_pr(), repository={"nameWithOwner": "o/r"})]))
+    monkeypatch.setattr(mg, "load_data_dirs", lambda: {})
+    monkeypatch.setattr(mg, "load_gate_config", lambda: {})
+    monkeypatch.setattr(mg, "is_loop_produced", lambda repo, num, pr: True)
+    monkeypatch.setattr(mg, "_read", boom)
+    s = mg.sweep()
+    assert len(s.failed) == 1
+    [row] = _rows()
+    assert row["decision"] == "NO_VERDICT" and row["reason"] == "tls blip"
+    assert row["source"] == "dependabot"
+
+
+def test_a_failed_ledger_write_is_reported_not_swallowed(monkeypatch, tmp_path):
+    blocker = tmp_path / "file"
+    blocker.write_text("")
+    monkeypatch.setenv("MERGE_GATE_LEDGER", str(blocker / "ledger.jsonl"))
+    monkeypatch.setattr(mg, "sh_strict", _gh([(".auto_merge != null", "false")]))
+    monkeypatch.setattr(mg, "changed_paths", lambda *a: ["src/x.py"])
+    s = mg.Sweep()
+    mg._evaluate(dict(_bot_pr(), title="x"), "o/r", 7, {}, s)
+    assert len(s.review) == 1 and len(s.ledger_errors) == 1
+
+
+def test_a_real_run_refuses_to_start_without_a_writable_ledger(monkeypatch, capsys):
+    monkeypatch.setenv("MERGE_GATE_LEDGER", "off")
+    monkeypatch.setattr(mg, "DRY_RUN", False)
+    monkeypatch.setattr(mg, "sweep", lambda deadline=None: pytest.fail("swept"))
+    assert mg.main() == mg.EXIT_NO_LEDGER
+    assert "Refusing to merge" in capsys.readouterr().out
+
+
+def test_a_dry_run_does_not_need_the_ledger(monkeypatch):
+    monkeypatch.setenv("MERGE_GATE_LEDGER", "off")
+    monkeypatch.setattr(mg, "DRY_RUN", True)
+    monkeypatch.setattr(mg, "sweep", lambda deadline=None: mg.Sweep())
+    assert mg.main() == 0
+
+
+def _enum(prs):
+    e = cp.Enumeration(sorted({p["repository"]["nameWithOwner"] for p in prs}))
+    e.prs = list(prs)
+    return e

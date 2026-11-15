@@ -962,7 +962,7 @@ def test_repo_level_reads_happen_once_per_repo_per_sweep(monkeypatch):
     per_repo = [c for c in calls if ".allow_auto_merge" in c
                 or "required_status_checks" in c or "branches/main" in c]
     assert len(per_repo) == 3           # one each, not one each per PR
-    assert sum(".head.sha" in c for c in calls) == 3     # per-PR reads stay per PR
+    assert sum("--jq .head.sha" in c for c in calls) == 3  # per-PR reads stay per PR
 
 
 def test_a_failed_repo_read_is_not_cached(monkeypatch):

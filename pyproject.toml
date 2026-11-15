@@ -32,7 +32,7 @@ Homepage = "https://github.com/gr8monk3ys/merge-gate"
 # Flat layout with several top-level scripts; auto-discovery would refuse it.
 # verify-gates.py is a script, not a module, and is not installed -- it is a
 # one-shot operator check, not something another module imports.
-py-modules = ["classify_pr", "merge_gate", "ci_watchdog", "gh_transport"]
+py-modules = ["classify_pr", "merge_gate", "ci_watchdog", "gh_transport", "gate_ledger"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
