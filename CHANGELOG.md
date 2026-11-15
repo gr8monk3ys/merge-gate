@@ -3,6 +3,14 @@
 Releases before 0.9.0 are described by their commit and PR messages;
 `DECISIONS.md` tells why each rule exists.
 
+## 0.10.4 — growth counted in IDs
+
+### Security
+
+- **Where both sides list `passed_ids`, a stage's growth is its new unique
+  IDs**, not its rise in `tests`. Since 0.10.3 allows fewer IDs than passes,
+  running an existing test twice could otherwise pass as a new test.
+
 ## 0.10.3 — de-duplicated test IDs
 
 ### Changed
