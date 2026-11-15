@@ -3,6 +3,33 @@
 Releases before 0.9.0 are described by their commit and PR messages;
 `DECISIONS.md` tells why each rule exists.
 
+## 0.10.0 — test-count evidence
+
+### Added
+
+- **CI test counts gate tests-only merges.** A repo's workflow uploads an
+  Actions artifact `verify-report` (one file, `verify-report.json`: schema 1,
+  repo, tested commit, per-stage tests/passed/failed/skipped) for PR heads and
+  default-branch pushes. `verify_report()` reads the newest completed run on
+  that sha carrying it and validates it strictly; any problem is no evidence,
+  with the reason. Read once per commit per sweep, only for green PRs.
+- In repos with `allow_tests_only: true`, a tests-only PR now also needs
+  evidence for its head and its base: no failure at head, no stage dropped,
+  per-stage `tests` and `passed` not lower, and total tests up by at least the
+  test cases the diff adds (at least one when they can't be counted).
+  Otherwise it routes with a `VERIFY — ...` reason.
+- `repos.yml` `require_verify_evidence: true`: every shape the gate merges in
+  that repo needs head and base evidence with no failure at head and no
+  vanished stage.
+- Ledger rows carry the head and base counts in `artifacts.verify`.
+- `gh_transport.download()` for binary bodies; the REST route does not send
+  the token past GitHub's redirect to artifact storage.
+
+### Changed
+
+- An opted-in repo whose CI does not upload `verify-report` stops getting
+  tests-only merges: they route to review until it does.
+
 ## 0.9.2 — tests-only is opt-in
 
 ### Changed

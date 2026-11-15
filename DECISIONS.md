@@ -649,3 +649,42 @@ The diff is read from the compare API for exactly `base_sha...head_sha`,
 where `head_sha` is the single head read the merge is pinned to with
 `--match-head-commit`. `pulls/{n}/files` describes whatever the head is
 when it answers; a commit range cannot move under the reader.
+
+## X. Evidence from the run (0.10.0)
+
+### 38. A text scan cannot prove a test file runs to the end; a count can.
+
+0.9.2 made tests-only opt-in because `os._exit(0)` reached through
+`__import__`, `importlib` or `setattr` gets past any token scan, and pytest
+then reports success having run nothing. What does catch it is the number of
+tests that ran. So repos upload a `verify-report` artifact per tested commit,
+and a tests-only merge needs one for the head and one for the base its checks
+ran on: nothing failed, no stage vanished, no stage ran fewer tests or passed
+fewer, and the total grew by at least the cases the diff defines. A file that
+ends the run early cannot satisfy that — the tests after it never count.
+
+Choices, each the strict side of a fork:
+
+- **Newest run wins, as for checks.** An invalid newest report is not rescued
+  by an older valid one on the same sha.
+- **The commit in the report must equal the sha asked about, exactly.** A
+  PR's `pull_request` run tests the merge ref; a report naming that sha, or a
+  prefix, is no evidence. The base report must come from a run of the base
+  branch, so a PR run that happens to share the sha cannot stand in for it.
+- **"GitHub did not answer" is still not a finding.** An unanswered runs or
+  download read is NO VERDICT (retry). A missing, expired or invalid report
+  is an answer: no evidence, routed with the reason.
+- **Read only for green PRs.** Before the checks finish there is no complete
+  run to read, and routing a PR for lack of evidence while its CI is still
+  running would label it for a human for nothing.
+- **The new-case count is a lower bound.** `def test…` and `it(`/`test(` on
+  added lines; parametrised cases only add to the real number. A file where
+  none is found, or a language not read, makes the count unknown, and the
+  bar falls back to "grew by at least one", never to zero.
+- **`require_verify_evidence` is the weaker half, for every shape.** A
+  dependency bump legitimately changes no test count, so only "no failure
+  at head, no vanished stage" applies there.
+
+The report is produced by the workflow that runs the code under test. It is
+trusted as far as the step that writes it: derived from the runner's result
+files after the tests, not writable by the tests themselves.

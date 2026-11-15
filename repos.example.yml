@@ -25,3 +25,9 @@ repos:
     # Revert commit SHAs a human has looked at. A pause raised by a detected
     # revert of a gate merge clears only when its SHA is listed here.
     merge_gate_ack_reverts: []
+    # tests-only PRs may auto-merge -- only with a CI `verify-report`
+    # artifact for head and base showing more tests ran (see README).
+    allow_tests_only: false
+    # Every merged shape needs a verify-report at head and base: no failed
+    # test at head, no stage missing from it.
+    require_verify_evidence: false

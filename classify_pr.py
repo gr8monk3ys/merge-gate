@@ -578,6 +578,32 @@ def is_test_module(path):
 
 
 _RE_PY_TEST_DEF = re.compile(r"^\s*(?:async\s+)?def\s+(test\w*)\s*\(")
+# A JS/TS test case: `it(`, `test(`, `it.each(`. `describe(` is a group, not a case.
+_RE_JS_TEST_CASE = re.compile(r"^\s*(?:it|test)(?:\.each\b[^(]*\([^)]*\))?\s*\(")
+_JS_TEST_EXT = re.compile(r"\.(js|jsx|ts|tsx|mjs|cjs|mts|cts)$")
+
+
+def count_new_tests(files):
+    """How many test cases the added lines define, or None when that cannot
+    be counted for every file: a language not read here, or a file in which
+    no test is found. A lower bound -- parametrised cases add more at run
+    time -- so a count that the CI-reported delta must reach is never too
+    strict for an honest PR."""
+    total = 0
+    for f in files or []:
+        name = f.get("filename") or ""
+        if name.endswith(".py"):
+            pat = _RE_PY_TEST_DEF
+        elif _JS_TEST_EXT.search(name):
+            pat = _RE_JS_TEST_CASE
+        else:
+            return None
+        n = sum(1 for line in (f.get("patch") or "").splitlines()
+                if line.startswith("+") and pat.match(line[1:]))
+        if n == 0:
+            return None
+        total += n
+    return total or None
 
 
 def is_test_harness(path):
@@ -743,6 +769,7 @@ def parse_repos_yml(path=None):
                                        body.get("merge_gate_ack_reverts") or []],
             # Only a literal `true` opts in; anything else is the strict default.
             "allow_tests_only": body.get("allow_tests_only") is True,
+            "require_verify_evidence": body.get("require_verify_evidence") is True,
         }
     return out
 
@@ -763,7 +790,7 @@ def load_data_dirs():
 
 GATE_CONFIG_FIELDS = ("may_skip", "correctness_checks", "merge_gate_max_per_day",
                       "merge_gate_paused", "merge_gate_ack_reverts",
-                      "allow_tests_only")
+                      "allow_tests_only", "require_verify_evidence")
 
 
 def load_gate_config():
@@ -780,7 +807,12 @@ def load_gate_config():
       merge_gate_paused       true: hold every gate merge in this repo.
       allow_tests_only        true: tests-only PRs may auto-merge (still only
                               brand-new test modules). Absent: they route to
-                              review. Set it once CI reports test counts.
+                              review. Set it once CI uploads a verify-report
+                              artifact: a tests-only merge needs one for both
+                              the head and the base (merge_gate.verify_report).
+      require_verify_evidence true: EVERY shape the gate merges here needs a
+                              verify-report at head and base, with no failed
+                              test at head and no stage missing from it.
       merge_gate_ack_reverts  revert commit SHAs a human has looked at. A
                               pause raised by a detected revert clears only
                               when its SHA is listed here.

@@ -722,6 +722,39 @@ def run(argv, stdin=None):
     return rest_run(argv, stdin)
 
 
+def download(path):
+    """GET an API path whose body is binary (an Actions artifact zip).
+
+    Not a `run()` argv form: both routes there decode text, and a zip is not
+    text. Returns a Result whose stdout is bytes. GitHub answers with a
+    redirect to a signed storage URL; the REST route sends the token to the
+    API only (an unredirected header), never on to the storage host.
+    """
+    if MODE != "rest" and (MODE == "gh" or binary_works()):
+        try:
+            r = subprocess.run(["gh", "api", path], capture_output=True,
+                               timeout=CALL_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            return Result(124, b"", f"gh timed out after {CALL_TIMEOUT_SECONDS}s: "
+                                    f"gh api {path}")
+        return Result(r.returncode, r.stdout, r.stderr.decode(errors="replace"))
+    tok = token()
+    if not tok:
+        return Result(1, b"", "gh-transport: no GitHub credential")
+    req = urllib.request.Request(f"{API}/{path.lstrip('/')}")
+    req.add_unredirected_header("Authorization", f"Bearer {tok}")
+    req.add_header("Accept", "application/vnd.github+json")
+    req.add_header("X-GitHub-Api-Version", "2022-11-28")
+    req.add_header("User-Agent", UA)
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            return Result(0, resp.read(), "")
+    except urllib.error.HTTPError as e:
+        return Result(1, b"", f"gh: {e.reason} (HTTP {e.code})")
+    except urllib.error.URLError as e:
+        return Result(1, b"", f"gh-transport: connection error: {e.reason}")
+
+
 # What a Claude Code session's GitHub proxy says when a call needs GraphQL.
 # Matched narrowly: any other failure must surface as itself.
 GRAPHQL_REFUSED = "graphql is not available"

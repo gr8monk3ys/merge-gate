@@ -11,6 +11,10 @@ Four conditions, ALL required, no overrides:
      `skipped` only where repos.yml `may_skip` allows it
   4. those checks ran against the base branch's CURRENT head
 
+A green tests-only PR (and, with repos.yml require_verify_evidence, any
+green PR) must also show CI-reported test counts at head and base that
+license it (judge_evidence); otherwise it routes with a VERIFY reason.
+
 Then the circuit breakers (breaker_reason) can still HOLD a green PR: a
 paused repo, an unacknowledged revert of a gate merge, the per-repo daily
 merge cap, or a red base. Every verdict is appended to the merge ledger
@@ -54,9 +58,10 @@ from concurrent.futures import ThreadPoolExecutor
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import gate_ledger as ledger  # noqa: E402
+import gh_transport  # noqa: E402
 from classify_pr import (  # noqa: E402
     DEFAULT_WORKERS, Abandoned, _run_gh, auto_mergeable, bail_if, bump_kind,
-    changed_paths, classify, conflict_self_heals, content_veto,
+    changed_paths, classify, conflict_self_heals, content_veto, count_new_tests,
     enumerate_open_prs, is_conflict, is_correctness_check, is_dependabot,
     load_data_dirs, load_gate_config, promote_candidate, repo_visibility,
     tests_only_veto,
@@ -672,6 +677,10 @@ class Reading:
         self.head_sha: str | None = None   # head when the arm was read
         self.base_ref: str | None = None
         self.base_sha: str | None = None
+        # CI-reported test counts at head and base, for the ledger, and the
+        # reason they do not license a merge (applied only to a green PR).
+        self.evidence: dict | None = None
+        self.evidence_why: str | None = None
 
 
 def _read(pr, repo, num, data_dirs, cache=None, stop=None):
@@ -732,13 +741,14 @@ def _read(pr, repo, num, data_dirs, cache=None, stop=None):
     # head -- the same sha --match-head-commit merges. Nothing re-reads it.
     # A token scan of new files can never prove they don't stop the run early
     # (os._exit at import makes the runner report success having run
-    # nothing). Until the repo's CI reports how many tests ran, so a drop is
-    # visible, tests-only stays a human call: a repo opts in explicitly.
+    # nothing); the count of tests CI ran can. So a repo opts in explicitly,
+    # and then every tests-only merge also needs that count (judge_evidence).
     if (r.mergeable and r.shape == "tests-only"
             and cache.config(repo).get("allow_tests_only") is not True):
         r.mergeable = False
         r.why = ("tests-only auto-merge is off for this repo: set allow_tests_only "
-                 "in repos.yml once its CI reports test counts")
+                 "in repos.yml once its CI uploads a verify-report artifact")
+    new_tests = None
     if r.mergeable and r.shape == "tests-only":
         st = r.state
         bail_if(stop)
@@ -756,6 +766,17 @@ def _read(pr, repo, num, data_dirs, cache=None, stop=None):
         if veto:
             r.mergeable = False
             r.why = f"tests-only rejected: {veto}"
+        new_tests = count_new_tests(files)
+    # Test counts from CI: required for tests-only, and for every shape in a
+    # repo that sets require_verify_evidence. Read only once the checks are
+    # green (branch_head is read only then): before that there is no finished
+    # run to read, and judge() already has the finding.
+    full = r.shape == "tests-only"
+    if (r.mergeable and r.state.branch_head is not None
+            and (full or cache.config(repo).get("require_verify_evidence") is True)):
+        bail_if(stop)
+        r.evidence, r.evidence_why = judge_evidence(
+            repo, r.state, cache, full, new_tests if full else None)
     return r
 
 
@@ -951,6 +972,180 @@ def base_tree_paths(repo, sha):
             if isinstance(e, dict) and e.get("path")]
 
 
+# --- CI-reported test counts (verify-report) --------------------------------
+#
+# A repo's workflow uploads an artifact `verify-report` holding one file,
+# verify-report.json: {"schema": 1, "repo": "o/r", "commit": "<tested sha>",
+# "stages": [{"stage", "tests", "passed", "failed", "skipped"}, ...]}. It is
+# how a tests-only PR proves the run did not end early: no scan of a new
+# file's text can, but a count that went down at head is visible.
+
+VERIFY_ARTIFACT = "verify-report"
+VERIFY_FILE = "verify-report.json"
+VERIFY_MAX_BYTES = 1 << 20          # a report is a few hundred bytes
+VERIFY = "VERIFY"                   # prefix of every evidence routing reason
+_COUNTS = ("tests", "passed", "failed", "skipped")
+
+
+def parse_verify_report(raw, repo, sha):
+    """(stages, None) or (None, reason) for the bytes of the artifact zip.
+
+    Strict: one file, schema 1, this repo, exactly this commit, at least one
+    stage, unique stage names, non-negative int counts that add up. Anything
+    else is no evidence, never partial evidence. `stages` is {name: counts}.
+    """
+    import io
+    import zipfile
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(raw))
+        infos = zf.infolist()
+        if [i.filename for i in infos] != [VERIFY_FILE]:
+            return None, (f"artifact must hold exactly {VERIFY_FILE}, has "
+                          f"{[i.filename for i in infos][:5]}")
+        if infos[0].file_size > VERIFY_MAX_BYTES:
+            return None, f"{VERIFY_FILE} is {infos[0].file_size} bytes"
+        doc = json.loads(zf.read(infos[0]))
+    except (zipfile.BadZipFile, ValueError, OSError) as exc:
+        return None, f"unreadable artifact: {str(exc)[:60]}"
+    if not isinstance(doc, dict):
+        return None, "report is not an object"
+    if type(doc.get("schema")) is not int or doc["schema"] != 1:
+        return None, f"schema {doc.get('schema')!r}, want 1"
+    if str(doc.get("repo") or "").lower() != repo.lower():
+        return None, f"report is for repo {doc.get('repo')!r}"
+    if doc.get("commit") != sha:
+        return None, f"report is for commit {str(doc.get('commit'))[:12]!r}"
+    raw_stages = doc.get("stages")
+    if not isinstance(raw_stages, list) or not raw_stages:
+        return None, "no stages"
+    stages = {}
+    for st in raw_stages:
+        name = st.get("stage") if isinstance(st, dict) else None
+        if not isinstance(name, str) or not name:
+            return None, "a stage has no name"
+        if name in stages:
+            return None, f"stage {name} listed twice"
+        counts = {k: st.get(k) for k in _COUNTS}
+        if any(type(v) is not int or v < 0 for v in counts.values()):
+            return None, f"stage {name}: counts must be non-negative integers"
+        if counts["passed"] + counts["failed"] + counts["skipped"] != counts["tests"]:
+            return None, f"stage {name}: passed+failed+skipped != tests"
+        stages[name] = counts
+    return stages, None
+
+
+def _json_lines(out, what):
+    """The arrays `--paginate --jq '[...]'` prints, one per line, joined."""
+    items = []
+    for line in (out or "").splitlines():
+        if not line.strip():
+            continue
+        try:
+            page = json.loads(line)
+        except json.JSONDecodeError:
+            raise ReadFailed(f"unparseable {what}")
+        if not isinstance(page, list):
+            raise ReadFailed(f"unexpected {what} shape")
+        items.extend(x for x in page if isinstance(x, dict))
+    return items
+
+
+def verify_report(repo, sha, branch=None):
+    """The verify-report CI uploaded for `sha`: ({"run", "stages"}, None), or
+    (None, reason) when there is none or it does not validate.
+
+    Read from the newest completed workflow run on that head_sha (on
+    `branch`, when given: a base's evidence must come from a run of the base
+    branch itself) that carries the artifact. Newest wins, as for checks: an
+    invalid newest report is not rescued by an older one. Raises ReadFailed
+    when GitHub did not answer -- that is no verdict, not missing evidence.
+    """
+    out = sh_strict("api", f"repos/{repo}/actions/runs?head_sha={sha}"
+                           "&status=completed&per_page=100", "--paginate", "--jq",
+                    "[.workflow_runs[]|{id,head_sha,head_branch,updated_at}]")
+    if out is None:
+        return None, "no Actions runs readable for this repo"
+    runs = [r for r in _json_lines(out, f"workflow runs for {sha[:8]}")
+            if r.get("head_sha") == sha
+            and (branch is None or r.get("head_branch") == branch)]
+    runs.sort(key=lambda r: (r.get("updated_at") or "", r.get("id") or 0), reverse=True)
+    for run in runs:
+        out = sh_strict("api", f"repos/{repo}/actions/runs/{run['id']}/artifacts"
+                               "?per_page=100", "--paginate", "--jq",
+                        "[.artifacts[]|{id,name,expired,size_in_bytes}]")
+        arts = [a for a in _json_lines(out, f"artifacts of run {run['id']}")
+                if a.get("name") == VERIFY_ARTIFACT]
+        if not arts:
+            continue
+        if len(arts) > 1:
+            return None, f"run {run['id']} has {len(arts)} {VERIFY_ARTIFACT} artifacts"
+        art = arts[0]
+        if art.get("expired"):
+            return None, f"run {run['id']}'s {VERIFY_ARTIFACT} has expired"
+        if (art.get("size_in_bytes") or 0) > VERIFY_MAX_BYTES:
+            return None, f"run {run['id']}'s {VERIFY_ARTIFACT} is too large"
+        r = gh_transport.download(f"repos/{repo}/actions/artifacts/{art['id']}/zip")
+        if r.returncode != 0:
+            err = (r.stderr or "").lower()
+            if any(k in err for k in ("404", "410", "not found", "expired", "gone")):
+                return None, f"run {run['id']}'s {VERIFY_ARTIFACT} could not be downloaded"
+            raise ReadFailed(f"{repo}: artifact download failed: "
+                             f"{(r.stderr or '').strip()[:80]}")
+        stages, why = parse_verify_report(r.stdout, repo, sha)
+        if stages is None:
+            return None, f"run {run['id']}: {why}"
+        return {"run": run["id"], "stages": stages}, None
+    where = f" on {branch}" if branch else ""
+    return None, f"no completed run{where} uploaded {VERIFY_ARTIFACT}"
+
+
+def evidence_reason(head, base, full=True, new_tests=None):
+    """Why the head's counts do not license a merge against the base's, or
+    None. `head`/`base` are {stage: counts}.
+
+    Always: no failed test at head, and no stage the base ran is missing at
+    head. `full` (tests-only) adds: per stage, tests and passed did not drop,
+    and the total grew by at least the cases the diff adds (`new_tests`), or
+    -- when they could not be counted -- by at least one.
+    """
+    for name, c in sorted(head.items()):
+        if c["failed"]:
+            return f"stage {name}: {c['failed']} failed at head"
+    gone = sorted(set(base) - set(head))
+    if gone:
+        return f"stage(s) {', '.join(gone)} ran at base but not at head"
+    if not full:
+        return None
+    for name in sorted(base):
+        for k in ("tests", "passed"):
+            if head[name][k] < base[name][k]:
+                return f"stage {name}: {k} {base[name][k]} -> {head[name][k]} at head"
+    grew = (sum(c["tests"] for c in head.values())
+            - sum(c["tests"] for c in base.values()))
+    need = new_tests if new_tests else 1
+    if grew < need:
+        what = (f"the {new_tests} new test case(s) the diff adds" if new_tests
+                else "at least one (new cases could not be counted)")
+        return f"total tests grew by {grew}, need {what}"
+    return None
+
+
+def judge_evidence(repo, st, cache, full, new_tests=None):
+    """(ledger record, routing reason or None) for a green PR's evidence:
+    the head's report against the report for the base its checks ran on."""
+    head, why = cache.get(("verify", repo, st.sha, None),
+                          lambda: verify_report(repo, st.sha))
+    if head is None:
+        return None, f"{VERIFY} — no evidence for head {st.sha[:8]}: {why}"
+    base, why = cache.get(("verify", repo, st.base_sha, st.base),
+                          lambda: verify_report(repo, st.base_sha, st.base))
+    rec = {"head": head, "base": base}
+    if base is None:
+        return rec, f"{VERIFY} — no evidence for base {st.base_sha[:8]}: {why}"
+    why = evidence_reason(head["stages"], base["stages"], full, new_tests)
+    return rec, (f"{VERIFY} — {why}" if why else None)
+
+
 def pr_source(pr):
     """Who produced this PR: dependabot | loop | other. For the ledger;
     the gate's own eligibility rule is is_loop_produced()."""
@@ -967,6 +1162,10 @@ def ledger_row(r, decision, reason, merge_commit_sha=None):
     st = getattr(r, "state", None)
     paths = getattr(r, "paths", None)
     pr = getattr(r, "pr", {}) or {}
+    artifacts = {"count": None if paths is None else len(paths),
+                 "paths": (paths or [])[:LEDGER_MAX_PATHS]}
+    if getattr(r, "evidence", None):
+        artifacts["verify"] = r.evidence
     return {
         "event": "verdict",
         "repo": r.repo, "pr": r.num, "title": getattr(r, "title", ""),
@@ -979,8 +1178,7 @@ def ledger_row(r, decision, reason, merge_commit_sha=None):
         "base_sha": st.base_sha if st else getattr(r, "base_sha", None),
         "checks": list(st.checks) if st else [],
         "green_by_skip": bool(st.green_by_skip) if st else False,
-        "artifacts": {"count": None if paths is None else len(paths),
-                      "paths": (paths or [])[:LEDGER_MAX_PATHS]},
+        "artifacts": artifacts,
         "decision": decision, "reason": reason,
         "dry_run": DRY_RUN,
         "merge_commit_sha": merge_commit_sha,
@@ -1060,6 +1258,12 @@ def _decide(r, s):
             _file(s, "drift", r, detail, ledger.DRIFT)
         else:
             _file(s, "skipped", r, detail, ledger.SKIPPED)
+        return
+
+    if green and r.evidence_why:
+        # Green, but CI's own counts say a test failed, a stage vanished or
+        # (tests-only) fewer tests ran: a human reads that, not the gate.
+        _file(s, "review", r, r.evidence_why, ledger.ROUTED)
         return
 
     if green:
