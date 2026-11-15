@@ -3,6 +3,14 @@
 Releases before 0.9.0 are described by their commit and PR messages;
 `DECISIONS.md` tells why each rule exists.
 
+## 0.10.5 — growth needs both measures
+
+### Security
+
+- **A stage's growth is the rise in `tests`, capped by its new unique IDs.**
+  0.10.4 counted IDs alone, so splitting a rerun test's one ID into two
+  counted as a new test.
+
 ## 0.10.4 — growth counted in IDs
 
 ### Security

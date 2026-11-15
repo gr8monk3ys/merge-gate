@@ -987,6 +987,9 @@ def _i(ids):
      "total tests grew by 0, need at least one (new cases could not be counted)"),
     ({"u": dict(_c(6), passed_ids=["a", "b", "x"])}, {"u": dict(_c(4), passed_ids=["a", "b"])},
      True, 1, None),
+    # Splitting one rerun ID into two adds an ID but runs nothing new.
+    ({"u": dict(_c(4), passed_ids=["a", "a2", "b"])}, {"u": dict(_c(4), passed_ids=["a", "b"])},
+     True, None, "total tests grew by 0, need at least one (new cases could not be counted)"),
     # IDs at base but not at head: no downgrade to the count rules.
     ({"u": _c(11)}, {"u": _i(["a", "b"])}, True, 1,
      "stage u: passed_ids at base but not at head"),
