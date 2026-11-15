@@ -914,6 +914,9 @@ def difftest():
           "--jq", ".[0].commit.committer.date"], True),
         (["gh", "api", f"repos/{repo}/commits/{branch}/check-runs",
           "--jq", "[.check_runs[]|{name,conclusion}]"], True),
+        # merge_gate.pr_files: the tests-only content check. Raw pages.
+        (["gh", "api", "repos/" + repo + "/pulls/" + os.environ.get(
+            "DIFFTEST_PR", "1") + "/files?per_page=100", "--paginate"], True),
         # merge_gate.branch_commits: revert detection. Raw pages, no jq.
         (["gh", "api", f"repos/{repo}/commits?sha={branch}"
                        "&since=2026-11-01T00:00:00Z&per_page=100", "--paginate"],

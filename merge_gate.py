@@ -51,6 +51,7 @@ from classify_pr import (  # noqa: E402
     changed_paths, classify, conflict_self_heals, content_veto,
     enumerate_open_prs, is_conflict, is_correctness_check, is_dependabot,
     load_data_dirs, load_gate_config, promote_candidate, repo_visibility,
+    tests_only_veto,
 )
 
 DRY_RUN = os.environ.get("DRY_RUN", "1") != "0"
@@ -698,6 +699,20 @@ def _read(pr, repo, num, data_dirs, cache=None, stop=None):
             kind = bump_kind(title, body)
             r.why = f"shape={r.shape}" + (f"; bump={kind}" if kind else "")
 
+    # A tests-only shape is a claim about paths; whether the diff weakens the
+    # tests is a claim about content, so read the patch. Only for this shape:
+    # it is the one whose risk lives in the lines rather than the files.
+    if r.mergeable and r.shape == "tests-only":
+        bail_if(stop)
+        files = pr_files(repo, num)
+        if sorted(f.get("filename") or "" for f in files) != sorted(paths):
+            # The PR moved between the two reads; judge it next sweep, whole.
+            raise ReadFailed(f"{repo}#{num}: diff changed between reads")
+        veto = tests_only_veto(files)
+        if veto:
+            r.mergeable = False
+            r.why = f"tests-only rejected: {veto}"
+
     # Is there a standing arm? Read for every shape: an arm outside the
     # allowlist is drift to correct, and an arm on an allowlisted PR is a
     # standing permission to retire (see _decide).
@@ -862,6 +877,25 @@ def detect_reverts(rows, now=None, read=branch_commits):
                            f"#{hit.get('pr')}"),
             })
     return found, unscanned
+
+
+def pr_files(repo, num):
+    """pulls/{n}/files, every page: filename, status, patch. Raises
+    ReadFailed -- an unread patch is not a clean one."""
+    out = sh_strict("api", f"repos/{repo}/pulls/{num}/files?per_page=100",
+                    "--paginate")
+    if out is None:
+        raise ReadFailed(f"{repo}#{num}: pull request files not found")
+    try:
+        pages = _parse_pages(out)
+    except json.JSONDecodeError:
+        raise ReadFailed(f"{repo}#{num}: unparseable pull request files")
+    files = []
+    for page in pages:
+        if not isinstance(page, list):
+            raise ReadFailed(f"{repo}#{num}: unexpected files shape")
+        files.extend(f for f in page if isinstance(f, dict))
+    return files
 
 
 def pr_source(pr):

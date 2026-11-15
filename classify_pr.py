@@ -504,6 +504,93 @@ def ci_fix_allowed(diff_text):
     )
 
 
+# ---------------------------------------------------------------------------
+# tests-only is judged on content, not just paths.
+#
+# Every path being a test file says nothing about what the diff does to the
+# tests. Deleting a failing test, marking it skipped, focusing a suite with
+# `.only` so the rest never run, or loosening conftest.py all classify as
+# `tests-only` on paths alone -- and each one makes the required check
+# greener while proving less. These rules run on the PR's patch.
+# ---------------------------------------------------------------------------
+
+# Added lines matching any of these switch a test off (or switch every other
+# test off). Named, so the reason says which rule fired.
+TEST_DISABLERS = [
+    ("@pytest.mark.skip/skipif/xfail", r"@pytest\.mark\.(skip|skipif|xfail)\b"),
+    ("pytest.skip(/xfail(/importorskip(", r"\bpytest\.(skip|xfail|importorskip)\s*\("),
+    ("xfail", r"\bxfail\b"),
+    ("unittest skip", r"@unittest\.(skip|skipIf|skipUnless|expectedFailure)\b"
+                      r"|\bself\.skipTest\s*\("),
+    ("it/describe/test.skip/.only/.todo",
+     r"\b(it|describe|test|context|suite)\.(skip|only|todo)\b"),
+    (".only(", r"\.only\s*\("),
+    (".skip(", r"\.skip\s*\("),
+    ("xit/xdescribe/fit/fdescribe", r"\b(x|f)(it|describe|test)\s*\("),
+    ("t.Skip(", r"\bt\.Skip(Now|f)?\s*\("),
+    ("#[ignore]", r"#\[ignore\]"),
+]
+
+# One count per line. Deliberately broad: it is compared, removed vs added,
+# so a line it over-matches on both sides cancels out.
+ASSERTION = re.compile(r"\bassert|\bexpect\s*\(|\.should\b|\bshould\.|"
+                       r"\btoBe\w*\b|\btoEqual\b|\btoMatch\w*\b|\btoThrow\b")
+
+# What a test RUN is configured by. Touching any of it changes what runs, not
+# just what is tested: conftest.py fixtures apply to every test below them.
+_HARNESS_DIRS = {"e2e", "playwright", "cypress"}
+_HARNESS_FILES = [r"^conftest\.py$", r"^playwright\.config\.\w+$",
+                  r"^cypress\.config\.\w+$", r"^cypress\.json$"]
+
+
+def is_test_harness(path):
+    """conftest.py, or anything in / configuring e2e, Playwright or Cypress."""
+    parts = (path or "").split("/")
+    base = parts[-1]
+    return (any(re.match(p, base) for p in _HARNESS_FILES)
+            or any(seg in _HARNESS_DIRS for seg in parts[:-1]))
+
+
+def tests_only_veto(files):
+    """Why a `tests-only` diff must not auto-merge, or None.
+
+    `files` is the pulls/{n}/files payload: dicts with filename, status,
+    patch and (for renames) previous_filename. None -- the diff could not be
+    read -- vetoes, like everywhere else. Reasons are specific: they name the
+    file, the rule and, for a marker, the line.
+    """
+    if files is None:
+        return "could not read the diff to check test content"
+    if not files:
+        return "the diff lists no files"
+    added_asserts = removed_asserts = 0
+    for f in files:
+        name = f.get("filename") or ""
+        status = f.get("status") or ""
+        for p in (name, f.get("previous_filename")):
+            if p and is_test_harness(p):
+                return f"touches test harness/config: {p}"
+        if status == "removed":
+            return f"deletes test file {name}"
+        patch = f.get("patch")
+        if patch is None:
+            return f"no readable patch for {name} (binary or too large to judge)"
+        for line in patch.splitlines():
+            if line.startswith("+"):
+                body = line[1:]
+                for label, pat in TEST_DISABLERS:
+                    if re.search(pat, body):
+                        return (f"adds a test-disabling marker ({label}) in {name}: "
+                                f"{body.strip()[:80]}")
+                added_asserts += bool(ASSERTION.search(body))
+            elif line.startswith("-"):
+                removed_asserts += bool(ASSERTION.search(line[1:]))
+    if removed_asserts > added_asserts:
+        return (f"removes more assertions than it adds "
+                f"({removed_asserts} removed, {added_asserts} added)")
+    return None
+
+
 def gh_json(*args):
     r = _run_gh(["gh", *args])
     if r.returncode != 0:

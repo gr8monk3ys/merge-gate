@@ -671,3 +671,135 @@ def test_branch_commits_reads_every_page(monkeypatch):
     assert mg.branch_commits("o/r", "main", "2026-11-01T00:00:00Z") == [
         ("a" * 40, "x\n\ny"), ("b" * 40, "z")]
     assert "--paginate" in seen[0] and "since=2026-11-01T00:00:00Z" in seen[0][1]
+
+
+# --- item 5: tests-only is judged on content --------------------------------
+
+def _f(name, patch="", status="modified", prev=None):
+    d = {"filename": name, "status": status, "patch": patch}
+    if prev:
+        d["previous_filename"] = prev
+    return d
+
+
+def test_a_test_that_only_adds_assertions_passes():
+    patch = "@@ -1,2 +1,4 @@\n def test_x():\n+    y = f()\n+    assert y == 2\n     assert f()\n"
+    assert cp.tests_only_veto([_f("tests/test_x.py", patch)]) is None
+
+
+def test_a_deleted_test_file_is_rejected():
+    why = cp.tests_only_veto([_f("tests/test_x.py", "@@ -1 +0,0 @@\n-assert 1", "removed")])
+    assert why == "deletes test file tests/test_x.py"
+
+
+@pytest.mark.parametrize("line,label", [
+    ("@pytest.mark.skip(reason='flaky')", "@pytest.mark.skip"),
+    ("@pytest.mark.skipif(True, reason='x')", "@pytest.mark.skip"),
+    ("@pytest.mark.xfail", "@pytest.mark.skip"),
+    ("    pytest.skip('later')", "pytest.skip("),
+    ("    pytest.importorskip('numpy')", "pytest.skip("),
+    ("it.skip('renders', () => {", "it/describe/test.skip"),
+    ("describe.skip('suite', () => {", "it/describe/test.skip"),
+    ("describe.only('suite', () => {", "it/describe/test.skip"),
+    ("test.only('x', () => {})", "it/describe/test.skip"),
+    ("  suite.skip(() => {})", "it/describe/test.skip"),
+    ("xit('renders', () => {", "xit/xdescribe"),
+    ("fdescribe('suite', () => {", "xit/xdescribe"),
+    ("@unittest.skip('x')", "unittest skip"),
+    ("        self.skipTest('x')", "unittest skip"),
+    ("    t.Skip(\"later\")", "t.Skip("),
+    ("#[ignore]", "#[ignore]"),
+])
+def test_an_added_disabling_marker_is_rejected_and_named(line, label):
+    why = cp.tests_only_veto([_f("src/a.test.ts", f"@@ -1 +1,2 @@\n+{line}\n")])
+    assert why is not None and why.startswith("adds a test-disabling marker (")
+    assert label in why and "src/a.test.ts" in why and line.strip()[:20] in why
+
+
+def test_a_removed_marker_is_fine():
+    patch = "@@ -1,2 +1 @@\n-@pytest.mark.skip(reason='flaky')\n def test_x():\n"
+    assert cp.tests_only_veto([_f("tests/test_x.py", patch)]) is None
+
+
+def test_words_that_merely_contain_skip_are_not_markers():
+    patch = "@@ -1 +1,2 @@\n+    skip_empty = True\n+    assert parse(skip_empty)\n"
+    assert cp.tests_only_veto([_f("tests/test_x.py", patch)]) is None
+
+
+@pytest.mark.parametrize("path", [
+    "conftest.py", "tests/conftest.py", "e2e/login.spec.ts",
+    "apps/web/e2e/login.spec.ts", "playwright/fixtures.ts", "cypress/e2e/a.cy.ts",
+    "playwright.config.ts", "web/cypress.config.js",
+])
+def test_harness_and_e2e_paths_are_rejected(path):
+    why = cp.tests_only_veto([_f(path, "@@ -1 +1 @@\n+assert 1\n")])
+    assert why == f"touches test harness/config: {path}"
+
+
+def test_a_rename_out_of_the_harness_is_rejected_too():
+    why = cp.tests_only_veto([_f("tests/helpers.py", "", "renamed", prev="tests/conftest.py")])
+    assert why == "touches test harness/config: tests/conftest.py"
+
+
+def test_removing_more_assertions_than_adding_is_rejected_with_counts():
+    patch = ("@@ -1,4 +1,3 @@\n-    assert a == 1\n-    expect(b).toBe(2)\n"
+             "-    assert c\n+    assert a\n")
+    why = cp.tests_only_veto([_f("tests/test_x.py", patch)])
+    assert why == "removes more assertions than it adds (3 removed, 1 added)"
+
+
+def test_assertion_counts_span_every_file():
+    a = _f("tests/test_a.py", "@@ -1 +0,0 @@\n-    assert x\n")
+    b = _f("tests/test_b.py", "@@ -0,0 +1 @@\n+    assert y\n")
+    assert cp.tests_only_veto([a, b]) is None
+
+
+def test_a_file_with_no_patch_or_an_unread_diff_vetoes():
+    why = cp.tests_only_veto([{"filename": "tests/big.py", "status": "modified"}])
+    assert why.startswith("no readable patch for tests/big.py")
+    assert cp.tests_only_veto(None) == "could not read the diff to check test content"
+    assert cp.tests_only_veto([]) == "the diff lists no files"
+
+
+def _tests_only_pr(monkeypatch, files):
+    monkeypatch.setattr(mg, "changed_paths", lambda *a: [f["filename"] for f in files])
+    monkeypatch.setattr(mg, "sh_strict", _gh(
+        [("pulls/9/files", json.dumps(files)),
+         (".auto_merge != null", "false\nh9\nmain\nbase0\n")]
+        + [(k.replace("pulls/7", "pulls/9"), v) for k, v in
+           _repo(["ci"], [_run("ci", "success")])]
+        + [("commits/h9/check-runs", json.dumps([_run("ci", "success")]))]))
+    monkeypatch.setattr(mg, "DRY_RUN", True)
+    pr = {"number": 9, "title": "test: cover parser", "body": "", "labels": [],
+          "author": {"login": "bot"}, "headRefName": "auto/tests-20261115"}
+    s = mg.Sweep()
+    mg._evaluate(pr, "o/r", 9, {}, s)
+    return s
+
+
+def test_a_clean_tests_only_pr_still_merges(monkeypatch):
+    s = _tests_only_pr(monkeypatch, [_f("tests/test_p.py", "@@ -0,0 +1 @@\n+    assert p()\n")])
+    assert len(s.armed) == 1 and s.armed[0][2].startswith("tests-only; green")
+
+
+def test_a_tests_only_pr_that_skips_a_test_routes_to_review(monkeypatch):
+    s = _tests_only_pr(monkeypatch, [_f("tests/test_p.py", "@@ -1 +1,2 @@\n+@pytest.mark.skip\n")])
+    assert s.armed == []
+    [(_, _, why, _)] = s.review
+    assert why.startswith("tests-only rejected: adds a test-disabling marker")
+    assert _rows()[-1]["decision"] == "ROUTED"
+
+
+def test_a_diff_that_moved_between_reads_is_no_verdict(monkeypatch):
+    files = [_f("tests/test_p.py", "@@ -0,0 +1 @@\n+    assert p()\n")]
+    monkeypatch.setattr(mg, "sh_strict", _gh([("pulls/9/files", json.dumps(files))]))
+    monkeypatch.setattr(mg, "changed_paths", lambda *a: ["tests/test_p.py", "tests/test_q.py"])
+    pr = {"number": 9, "title": "t", "body": "", "labels": []}
+    with pytest.raises(mg.ReadFailed):
+        mg._read(pr, "o/r", 9, {})
+
+
+def test_pr_files_reads_every_page(monkeypatch):
+    monkeypatch.setattr(mg, "sh_strict", lambda *a: (
+        json.dumps([_f("tests/a.py")]) + "\n" + json.dumps([_f("tests/b.py")])))
+    assert [f["filename"] for f in mg.pr_files("o/r", 9)] == ["tests/a.py", "tests/b.py"]
