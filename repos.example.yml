@@ -31,3 +31,7 @@ repos:
     # Every merged shape needs a verify-report at head and base: no failed
     # test at head, no stage missing from it.
     require_verify_evidence: false
+    # The one workflow (by path) whose successful pull_request runs (head) and
+    # base-branch push runs (base) may supply the verify-report. Required by
+    # both flags above; absent means no evidence.
+    verify_workflow: .github/workflows/ci.yml

@@ -12,8 +12,9 @@ Four conditions, ALL required, no overrides:
   4. those checks ran against the base branch's CURRENT head
 
 A green tests-only PR (and, with repos.yml require_verify_evidence, any
-green PR) must also show CI-reported test counts at head and base that
-license it (judge_evidence); otherwise it routes with a VERIFY reason.
+green PR) must also show CI-reported test counts at head and base, from the
+repo's declared verify_workflow, that license it (judge_evidence); otherwise
+it routes with a VERIFY reason.
 
 Then the circuit breakers (breaker_reason) can still HOLD a green PR: a
 paused repo, an unacknowledged revert of a gate merge, the per-repo daily
@@ -48,6 +49,7 @@ public repos first spends nothing.
 """
 
 import datetime as dt
+import itertools
 import json
 import os
 import re
@@ -747,7 +749,8 @@ def _read(pr, repo, num, data_dirs, cache=None, stop=None):
             and cache.config(repo).get("allow_tests_only") is not True):
         r.mergeable = False
         r.why = ("tests-only auto-merge is off for this repo: set allow_tests_only "
-                 "in repos.yml once its CI uploads a verify-report artifact")
+                 "(and verify_workflow) in repos.yml once its CI uploads a verify-report "
+                 "artifact")
     new_tests = None
     if r.mergeable and r.shape == "tests-only":
         st = r.state
@@ -976,13 +979,15 @@ def base_tree_paths(repo, sha):
 #
 # A repo's workflow uploads an artifact `verify-report` holding one file,
 # verify-report.json: {"schema": 1, "repo": "o/r", "commit": "<tested sha>",
-# "stages": [{"stage", "tests", "passed", "failed", "skipped"}, ...]}. It is
-# how a tests-only PR proves the run did not end early: no scan of a new
-# file's text can, but a count that went down at head is visible.
+# "stages": [{"stage", "tests", "passed", "failed", "skipped",
+# "passed_ids"?}, ...]}. It is how a tests-only PR proves the run did not end
+# early: no scan of a new file's text can, but a count that went down at head
+# is visible, and a passing test ID that vanished at head names itself.
 
 VERIFY_ARTIFACT = "verify-report"
 VERIFY_FILE = "verify-report.json"
-VERIFY_MAX_BYTES = 1 << 20          # a report is a few hundred bytes
+VERIFY_MAX_IDS = 200_000            # passed_ids across all stages of one report
+VERIFY_MAX_BYTES = 1 << 25          # room for VERIFY_MAX_IDS IDs of ~150 bytes
 VERIFY = "VERIFY"                   # prefix of every evidence routing reason
 _COUNTS = ("tests", "passed", "failed", "skipped")
 
@@ -991,8 +996,10 @@ def parse_verify_report(raw, repo, sha):
     """(stages, None) or (None, reason) for the bytes of the artifact zip.
 
     Strict: one file, schema 1, this repo, exactly this commit, at least one
-    stage, unique stage names, non-negative int counts that add up. Anything
-    else is no evidence, never partial evidence. `stages` is {name: counts}.
+    stage, unique stage names, non-negative int counts that add up, and --
+    when a stage carries the optional `passed_ids` -- a sorted list of unique
+    non-empty strings, one per passed test. Anything else is no evidence,
+    never partial evidence. `stages` is {name: counts (+ "passed_ids")}.
     """
     import io
     import zipfile
@@ -1018,7 +1025,7 @@ def parse_verify_report(raw, repo, sha):
     raw_stages = doc.get("stages")
     if not isinstance(raw_stages, list) or not raw_stages:
         return None, "no stages"
-    stages = {}
+    stages, n_ids = {}, 0
     for st in raw_stages:
         name = st.get("stage") if isinstance(st, dict) else None
         if not isinstance(name, str) or not name:
@@ -1030,6 +1037,21 @@ def parse_verify_report(raw, repo, sha):
             return None, f"stage {name}: counts must be non-negative integers"
         if counts["passed"] + counts["failed"] + counts["skipped"] != counts["tests"]:
             return None, f"stage {name}: passed+failed+skipped != tests"
+        if "passed_ids" in st:
+            ids = st["passed_ids"]
+            if not isinstance(ids, list):
+                return None, f"stage {name}: passed_ids is not a list"
+            n_ids += len(ids)
+            if n_ids > VERIFY_MAX_IDS:
+                return None, f"more than {VERIFY_MAX_IDS} passed_ids"
+            if not all(isinstance(i, str) and i for i in ids):
+                return None, f"stage {name}: passed_ids must be non-empty strings"
+            if any(a >= b for a, b in itertools.pairwise(ids)):
+                return None, f"stage {name}: passed_ids not sorted and unique"
+            if len(ids) != counts["passed"]:
+                return None, (f"stage {name}: {len(ids)} passed_ids for "
+                              f"{counts['passed']} passed")
+            counts["passed_ids"] = ids
         stages[name] = counts
     return stages, None
 
@@ -1050,53 +1072,59 @@ def _json_lines(out, what):
     return items
 
 
-def verify_report(repo, sha, branch=None):
-    """The verify-report CI uploaded for `sha`: ({"run", "stages"}, None), or
-    (None, reason) when there is none or it does not validate.
+def verify_report(repo, sha, workflow, event, branch=None):
+    """The verify-report CI uploaded for `sha`: ({"run", "workflow", "event",
+    "stages"}, None), or (None, reason) when there is none or it does not
+    validate.
 
-    Read from the newest completed workflow run on that head_sha (on
-    `branch`, when given: a base's evidence must come from a run of the base
-    branch itself) that carries the artifact. Newest wins, as for checks: an
-    invalid newest report is not rescued by an older one. Raises ReadFailed
-    when GitHub did not answer -- that is no verdict, not missing evidence.
+    Provenance is fixed: only the newest completed run of `workflow` (the
+    repos.yml `verify_workflow` path) for `sha` triggered by `event`
+    (`pull_request` for a head, `push` for a base -- and then on `branch`)
+    counts. It must have concluded `success` and carry exactly one valid
+    artifact; otherwise that is no evidence. An older run never stands in for
+    the newest. Raises ReadFailed when GitHub did not answer -- that is no
+    verdict, not missing evidence.
     """
-    out = sh_strict("api", f"repos/{repo}/actions/runs?head_sha={sha}"
+    out = sh_strict("api", f"repos/{repo}/actions/runs?head_sha={sha}&event={event}"
                            "&status=completed&per_page=100", "--paginate", "--jq",
-                    "[.workflow_runs[]|{id,head_sha,head_branch,updated_at}]")
+                    "[.workflow_runs[]|{id,head_sha,head_branch,updated_at,"
+                    "path,event,conclusion}]")
     if out is None:
         return None, "no Actions runs readable for this repo"
     runs = [r for r in _json_lines(out, f"workflow runs for {sha[:8]}")
-            if r.get("head_sha") == sha
+            if r.get("head_sha") == sha and r.get("path") == workflow
+            and r.get("event") == event
             and (branch is None or r.get("head_branch") == branch)]
-    runs.sort(key=lambda r: (r.get("updated_at") or "", r.get("id") or 0), reverse=True)
-    for run in runs:
-        out = sh_strict("api", f"repos/{repo}/actions/runs/{run['id']}/artifacts"
-                               "?per_page=100", "--paginate", "--jq",
-                        "[.artifacts[]|{id,name,expired,size_in_bytes}]")
-        arts = [a for a in _json_lines(out, f"artifacts of run {run['id']}")
-                if a.get("name") == VERIFY_ARTIFACT]
-        if not arts:
-            continue
-        if len(arts) > 1:
-            return None, f"run {run['id']} has {len(arts)} {VERIFY_ARTIFACT} artifacts"
-        art = arts[0]
-        if art.get("expired"):
-            return None, f"run {run['id']}'s {VERIFY_ARTIFACT} has expired"
-        if (art.get("size_in_bytes") or 0) > VERIFY_MAX_BYTES:
-            return None, f"run {run['id']}'s {VERIFY_ARTIFACT} is too large"
-        r = gh_transport.download(f"repos/{repo}/actions/artifacts/{art['id']}/zip")
-        if r.returncode != 0:
-            err = (r.stderr or "").lower()
-            if any(k in err for k in ("404", "410", "not found", "expired", "gone")):
-                return None, f"run {run['id']}'s {VERIFY_ARTIFACT} could not be downloaded"
-            raise ReadFailed(f"{repo}: artifact download failed: "
-                             f"{(r.stderr or '').strip()[:80]}")
-        stages, why = parse_verify_report(r.stdout, repo, sha)
-        if stages is None:
-            return None, f"run {run['id']}: {why}"
-        return {"run": run["id"], "stages": stages}, None
-    where = f" on {branch}" if branch else ""
-    return None, f"no completed run{where} uploaded {VERIFY_ARTIFACT}"
+    where = f"{workflow} {event}" + (f" on {branch}" if branch else "")
+    if not runs:
+        return None, f"no completed {where} run"
+    run = max(runs, key=lambda r: (r.get("updated_at") or "", r.get("id") or 0))
+    if run.get("conclusion") != "success":
+        return None, f"newest {where} run {run['id']} concluded {run.get('conclusion')}"
+    out = sh_strict("api", f"repos/{repo}/actions/runs/{run['id']}/artifacts"
+                           "?per_page=100", "--paginate", "--jq",
+                    "[.artifacts[]|{id,name,expired,size_in_bytes}]")
+    arts = [a for a in _json_lines(out, f"artifacts of run {run['id']}")
+            if a.get("name") == VERIFY_ARTIFACT]
+    if len(arts) != 1:
+        return None, f"run {run['id']} has {len(arts)} {VERIFY_ARTIFACT} artifacts"
+    art = arts[0]
+    if art.get("expired"):
+        return None, f"run {run['id']}'s {VERIFY_ARTIFACT} has expired"
+    if (art.get("size_in_bytes") or 0) > VERIFY_MAX_BYTES:
+        return None, f"run {run['id']}'s {VERIFY_ARTIFACT} is too large"
+    r = gh_transport.download(f"repos/{repo}/actions/artifacts/{art['id']}/zip")
+    if r.returncode != 0:
+        err = (r.stderr or "").lower()
+        if any(k in err for k in ("404", "410", "not found", "expired", "gone")):
+            return None, f"run {run['id']}'s {VERIFY_ARTIFACT} could not be downloaded"
+        raise ReadFailed(f"{repo}: artifact download failed: "
+                         f"{(r.stderr or '').strip()[:80]}")
+    stages, why = parse_verify_report(r.stdout, repo, sha)
+    if stages is None:
+        return None, f"run {run['id']}: {why}"
+    return {"run": run["id"], "workflow": workflow, "event": event,
+            "stages": stages}, None
 
 
 def evidence_reason(head, base, full=True, new_tests=None):
@@ -1104,9 +1132,11 @@ def evidence_reason(head, base, full=True, new_tests=None):
     None. `head`/`base` are {stage: counts}.
 
     Always: no failed test at head, and no stage the base ran is missing at
-    head. `full` (tests-only) adds: per stage, tests and passed did not drop,
-    and the total grew by at least the cases the diff adds (`new_tests`), or
-    -- when they could not be counted -- by at least one.
+    head. `full` (tests-only) adds: per stage, tests and passed did not drop
+    and skipped did not rise; where both sides list `passed_ids`, every ID
+    that passed at base passed at head; and the total grew by at least the
+    cases the diff adds (`new_tests`), or -- when they could not be counted --
+    by at least one.
     """
     for name, c in sorted(head.items()):
         if c["failed"]:
@@ -1117,33 +1147,56 @@ def evidence_reason(head, base, full=True, new_tests=None):
     if not full:
         return None
     for name in sorted(base):
+        h, b = head[name], base[name]
         for k in ("tests", "passed"):
-            if head[name][k] < base[name][k]:
-                return f"stage {name}: {k} {base[name][k]} -> {head[name][k]} at head"
+            if h[k] < b[k]:
+                return f"stage {name}: {k} {b[k]} -> {h[k]} at head"
+        if h["skipped"] > b["skipped"]:
+            return f"stage {name}: skipped {b['skipped']} -> {h['skipped']} at head"
+        if "passed_ids" in h and "passed_ids" in b:
+            gone = sorted(set(b["passed_ids"]) - set(h["passed_ids"]))
+            if gone:
+                return (f"stage {name}: {gone[0]} passed at base but not at head"
+                        + (f" (+{len(gone) - 1} more)" if len(gone) > 1 else ""))
+    need = new_tests if new_tests else 1
+    what = (f"the {new_tests} new test case(s) the diff adds" if new_tests
+            else "at least one (new cases could not be counted)")
     grew = (sum(c["tests"] for c in head.values())
             - sum(c["tests"] for c in base.values()))
-    need = new_tests if new_tests else 1
+    # With IDs this also bounds the new IDs: base IDs all pass at head, there
+    # is one ID per pass, and skipped/failed cannot rise, so new IDs >= grew.
     if grew < need:
-        what = (f"the {new_tests} new test case(s) the diff adds" if new_tests
-                else "at least one (new cases could not be counted)")
         return f"total tests grew by {grew}, need {what}"
     return None
 
 
 def judge_evidence(repo, st, cache, full, new_tests=None):
     """(ledger record, routing reason or None) for a green PR's evidence:
-    the head's report against the report for the base its checks ran on."""
-    head, why = cache.get(("verify", repo, st.sha, None),
-                          lambda: verify_report(repo, st.sha))
+    the head's report (a pull_request run) against the report for the base
+    its checks ran on (a push run of the base branch), both from the repo's
+    declared verify_workflow. The ledger record keeps counts, not IDs."""
+    wf = cache.config(repo).get("verify_workflow")
+    if not isinstance(wf, str) or not wf:
+        return None, (f"{VERIFY} — no evidence: verify_workflow is not set for "
+                      "this repo in repos.yml")
+    head, why = cache.get(("verify", repo, st.sha, wf, "pull_request", None),
+                          lambda: verify_report(repo, st.sha, wf, "pull_request"))
     if head is None:
         return None, f"{VERIFY} — no evidence for head {st.sha[:8]}: {why}"
-    base, why = cache.get(("verify", repo, st.base_sha, st.base),
-                          lambda: verify_report(repo, st.base_sha, st.base))
-    rec = {"head": head, "base": base}
+    base, why = cache.get(("verify", repo, st.base_sha, wf, "push", st.base),
+                          lambda: verify_report(repo, st.base_sha, wf, "push", st.base))
+    rec = {"head": _for_ledger(head), "base": _for_ledger(base)}
     if base is None:
         return rec, f"{VERIFY} — no evidence for base {st.base_sha[:8]}: {why}"
     why = evidence_reason(head["stages"], base["stages"], full, new_tests)
     return rec, (f"{VERIFY} — {why}" if why else None)
+
+
+def _for_ledger(rep):
+    """A report without its passed_ids: a ledger row is not a test list."""
+    return rep and dict(rep, stages={
+        n: {k: v for k, v in c.items() if k != "passed_ids"}
+        for n, c in rep["stages"].items()})
 
 
 def pr_source(pr):

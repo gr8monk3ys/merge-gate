@@ -80,36 +80,62 @@ repo's CI uploads an Actions artifact named `verify-report` holding one file,
 
 ```json
 {"schema": 1, "repo": "owner/name", "commit": "<tested sha>",
- "stages": [{"stage": "unit", "tests": 120, "passed": 118, "failed": 0, "skipped": 2}]}
+ "stages": [{"stage": "unit", "tests": 120, "passed": 118, "failed": 0, "skipped": 2,
+             "passed_ids": ["tests/test_a.py::test_one", "..."]}]}
 ```
 
-from the workflow run for every PR head (`commit` = the PR head sha, not the
-`refs/pull/N/merge` sha) and every default-branch push (`commit` = the pushed
-sha). The gate reads the newest completed run on that `head_sha` that carries
-the artifact (for the base: a run of the base branch itself), downloads it,
-and validates it strictly — schema `1`, this repo, exactly this commit,
-stages non-empty and uniquely named, counts non-negative integers with
-`passed + failed + skipped == tests`. Anything else is *no evidence*, with
+from one workflow, declared per repo in `repos.yml` as
+`verify_workflow: .github/workflows/ci.yml`, on every `pull_request` (`commit`
+= the PR head sha, not the `refs/pull/N/merge` sha) and every `push` to the
+default branch (`commit` = the pushed sha). Without `verify_workflow` there is
+no evidence at all (`VERIFY — no evidence: verify_workflow is not set ...`).
+
+**Provenance.** For a PR head the gate takes the newest completed run of
+exactly that workflow path with event `pull_request` on that `head_sha`; for
+the base, the newest completed `push` run of it on the base branch. Only that
+one run counts: it must have concluded `success` and carry exactly one
+`verify-report` artifact. If it failed, was cancelled, or has no (or an
+invalid) report, that is *no evidence* — an older run is never used instead.
+Other workflows' artifacts, `workflow_dispatch` runs and the like are ignored.
+The run id, workflow path and event go into the ledger.
+
+**Validation** is strict — schema `1`, this repo, exactly this commit, stages
+non-empty and uniquely named, counts non-negative integers with
+`passed + failed + skipped == tests`. `passed_ids` is optional per stage; when
+present it must be a list of non-empty strings, sorted (Python `sorted()`,
+i.e. by code point) and unique, with exactly `passed` entries. More than
+200,000 IDs in one report is no evidence. Anything else is *no evidence*, with
 the reason. Reports are read once per commit per sweep, and only for a PR
 whose required checks are already green.
 
 A **tests-only** PR (in a repo with `allow_tests_only: true`) merges only
 with evidence for both its head and the base its checks ran against, and
 only when: no test failed at head; every stage the base ran is present at
-head; per stage, `tests` and `passed` did not drop; and the total grew by at
-least the test cases the diff adds (`def test…` in Python, `it(`/`test(` in
-JS/TS) — or by at least one when they cannot be counted. Otherwise it routes
-with the reason, e.g. `VERIFY — stage e2e: tests 70 -> 64 at head`.
+head; per stage, `tests` and `passed` did not drop and `skipped` did not rise;
+where both head and base list `passed_ids` for a stage, every ID that passed
+at base passed at head; and the total grew by at least the test cases the diff
+adds (`def test…` in Python, `it(`/`test(` in JS/TS) — or by at least one when
+they cannot be counted. With IDs, that growth is new IDs: base IDs all pass at
+head and there is one ID per pass. Otherwise it routes with the reason, e.g.
+`VERIFY — stage e2e: tests 70 -> 64 at head` or
+`VERIFY — stage unit: tests/test_a.py::test_one passed at base but not at head`.
+Without IDs a swap (one old test stops running, one new one starts) leaves the
+counts unchanged, so emit `passed_ids` when the runner can.
 
 `require_verify_evidence: true` in `repos.yml` applies the first two
 conditions (no failure at head, no vanished stage) to **every** shape the gate
-merges in that repo. Either way the head and base counts go into the ledger
-row's `artifacts.verify`.
+merges in that repo. Either way the head and base run, workflow, event and
+counts (never the IDs) go into the ledger row's `artifacts.verify`.
 
-The report is written by the workflow that runs the code under test, so it is
-only as honest as the step that writes it: compute it from the runner's own
-result files (JUnit XML, `--json`) in a step after the tests, not from
-anything the tests themselves can write.
+**What this does not defend against.** The report is produced by CI that
+runs the PR's own code: a `pull_request` run executes whatever the PR adds,
+and that code can write any report it likes, or rewrite the step that writes
+it. The evidence defends against *accidental* weakening — an agent's new test
+file that ends the run early, a test that quietly stopped running — not a
+deliberately malicious PR. That is why tests-only auto-merge stays opt-in per
+repo (`allow_tests_only`), and why the report should be computed from the
+runner's own result files (JUnit XML, `--json`) in a step after the tests,
+not from anything the tests themselves write.
 
 ## Merge ledger
 
@@ -226,7 +252,8 @@ Optional: `repos.yml` (see `repos.example.yml`), looked for at
 reads `data_dir` (opt-in data paths), `may_skip` (required checks that may
 pass as skipped), `correctness_checks` (check names that are gates despite
 their names), `merge_gate_max_per_day`, `merge_gate_paused` and
-`merge_gate_ack_reverts`, `allow_tests_only` and `require_verify_evidence`.
+`merge_gate_ack_reverts`, `allow_tests_only`, `require_verify_evidence` and
+`verify_workflow`.
 Every absent field is the strict value. The
 merge policy itself is constants at the top of `classify_pr.py`, and
 changing what merges is a one-line, deliberate edit.
