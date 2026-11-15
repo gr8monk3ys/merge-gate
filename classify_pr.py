@@ -539,19 +539,43 @@ TEST_DISABLERS = [
     ("xit/xdescribe/fit/fdescribe", r"\b(x|f)(it|describe|test)\s*\("),
     ("t.Skip(", r"\bt\.Skip(Now|f)?\s*\("),
     ("#[ignore]", r"#\[ignore\]"),
+    # Ending the process early makes a runner report success having run
+    # nothing: `os._exit(0)` at import time kills pytest with exit status 0.
+    ("process exit", r"\b(os\._exit|sys\.exit|pytest\.exit|process\.exit|"
+                     r"process\.kill|os\.Exit|runtime\.Goexit)\b"
+                     r"|^\s*(exit|quit)\s*\(|\bfunc\s+TestMain\b"),
+    ("sys.modules / builtins patching", r"\bsys\.modules\b|\bbuiltins\.\w+\s*="),
 ]
 
 # What a test RUN is configured by. A new file here changes what runs, not
 # just what is tested: conftest.py fixtures apply to every test below them.
 _HARNESS_DIRS = {"e2e", "playwright", "cypress"}
 _HARNESS_FILES = [
-    r"^conftest\.py$", r"^pytest\.ini$", r"^tox\.ini$", r"^setup\.cfg$",
-    r"^pyproject\.toml$", r"^\.coveragerc$",
+    r"^conftest\.py$", r"^\.?pytest\.(ini|toml)$", r"^tox\.ini$", r"^setup\.cfg$",
+    r"^pyproject\.toml$", r"^\.coveragerc$", r"^__init__\.py$",
+    r"^package\.json$", r"^tsconfig(\.[\w-]+)?\.json$",
+    r"^babel\.config\.\w+$", r"^\.babelrc(\.\w+)?$", r"^\.env(\..*)?$",
     r"^playwright\.config\.\w+$", r"^cypress\.config\.\w+$", r"^cypress\.json$",
     r"^jest\.config\.\w+$", r"^jest\.setup\.\w+$", r"^vitest\.config\.\w+$",
     r"^vitest\.workspace\.\w+$", r"^vitest\.setup\.\w+$", r"^setupTests\.\w+$",
     r"^karma\.conf\.\w+$", r"^\.mocharc(\.\w+)?$",
 ]
+
+# The only new files a tests-only PR may add: modules a test runner collects
+# and executes as tests. Helpers, fixtures data, configs, dotfiles and
+# __init__.py change what runs without being tests themselves.
+_TEST_MODULE_NAMES = [
+    r"^test_[\w-]+\.py$", r"^[\w-]+_test\.py$",
+    r"^[\w.-]+\.(test|spec)\.(js|jsx|ts|tsx|mjs|cjs|mts|cts)$",
+    r"^[\w-]+_test\.go$", r"^[\w-]+_spec\.rb$",
+]
+
+
+def is_test_module(path):
+    """A file a test runner collects as tests (by its name), not a helper."""
+    base = (path or "").rsplit("/", 1)[-1]
+    return any(re.match(p, base) for p in _TEST_MODULE_NAMES)
+
 
 _RE_PY_TEST_DEF = re.compile(r"^\s*(?:async\s+)?def\s+(test\w*)\s*\(")
 
@@ -601,6 +625,9 @@ def tests_only_veto(files, existing_paths=()):
                     "files auto-merge")
         if not is_test(name):
             return f"{name} is not a test path"
+        if not is_test_module(name):
+            return (f"{name} is not a test module (only files named like "
+                    "test_*.py, *_test.py, *.test.ts, *.spec.js, *_test.go auto-merge)")
         # A new test module named like an existing file can shadow it (pytest
         # rootdir-less imports, jest haste maps), and two new ones can shadow
         # each other.
