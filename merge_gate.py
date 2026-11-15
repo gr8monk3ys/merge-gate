@@ -48,7 +48,7 @@ from classify_pr import (  # noqa: E402
     DEFAULT_WORKERS, Abandoned, _run_gh, auto_mergeable, bail_if, bump_kind,
     changed_paths, classify, conflict_self_heals, content_veto,
     enumerate_open_prs, is_conflict, is_dependabot, load_data_dirs,
-    promote_candidate, repo_visibility,
+    load_gate_config, promote_candidate, repo_visibility,
 )
 
 DRY_RUN = os.environ.get("DRY_RUN", "1") != "0"
@@ -189,6 +189,58 @@ def auto_merge_allowed(repo):
     return out.strip() == "true"
 
 
+def check_runs(repo, sha):
+    """Every check run on `sha`, across every page. Raises ReadFailed.
+
+    The check-runs endpoint pages at 30 by default. It used to be read as one
+    page, so a commit with more than 30 runs -- a matrix build is enough --
+    could have its required check on page two, read as "not run", or worse,
+    have only an older attempt of it visible. `--paginate` with a
+    per-page projection emits one JSON array per page, one per line (§23).
+    """
+    out = sh_strict("api", f"repos/{repo}/commits/{sha}/check-runs?per_page=100",
+                    "--paginate", "--jq",
+                    "[.check_runs[]|{id,name,status,conclusion,started_at,"
+                    "completed_at,app:.app.slug}]")
+    if out is None:
+        raise ReadFailed(f"{repo}: check-runs not found for {sha[:8]}")
+    runs = []
+    for line in out.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            page = json.loads(line)
+        except json.JSONDecodeError:
+            raise ReadFailed(f"{repo}: unparseable check-runs for {sha[:8]}")
+        if not isinstance(page, list):
+            raise ReadFailed(f"{repo}: unexpected check-runs shape for {sha[:8]}")
+        runs.extend(r for r in page if isinstance(r, dict))
+    return runs
+
+
+def _run_age(run):
+    """Sort key: newer runs sort higher. completed_at, else started_at (an
+    in-flight re-run has no completed_at yet), then id as the tiebreak --
+    ids are allocated in creation order."""
+    return (run.get("completed_at") or run.get("started_at") or "",
+            run.get("id") or 0)
+
+
+def latest_by_name(runs):
+    """{name: newest run}. A re-run creates a second run with the same name;
+    keeping whichever the API listed last let a stale success shadow a newer
+    failure, or the reverse."""
+    out = {}
+    for r in runs:
+        name = r.get("name")
+        if name is None:
+            continue
+        if name not in out or _run_age(r) > _run_age(out[name]):
+            out[name] = r
+    return out
+
+
 def base_head(repo, branch):
     out = sh_strict("api", f"repos/{repo}/branches/{branch}", "--jq", ".commit.sha")
     if out is None:
@@ -210,9 +262,15 @@ class RepoCache:
     as before.
     """
 
-    def __init__(self):
+    def __init__(self, gate_cfg=None):
         self._vals, self._locks = {}, {}
         self._lock = threading.Lock()
+        # repos.yml's per-repo gate settings (load_gate_config), keyed by bare
+        # repo name. Configuration, not a read: it is fixed for the sweep.
+        self.gate_cfg = gate_cfg or {}
+
+    def config(self, repo):
+        return self.gate_cfg.get(repo.split("/")[-1]) or {}
 
     def get(self, key, read):
         with self._lock:
@@ -265,19 +323,65 @@ class State:
     are never fetched, exactly as before.
     """
 
-    def __init__(self, repo, number, sha, base, base_sha, draft, mstate):
+    def __init__(self, repo, number, sha, base, base_sha, draft, mstate,
+                 cfg=None):
         self.repo, self.number = repo, number
         self.sha, self.base, self.base_sha = sha, base, base_sha
         self.draft = draft.strip().lower() == "true"
         self.conflict = is_conflict(mstate)
+        cfg = cfg or {}
+        self.may_skip = list(cfg.get("may_skip") or [])
+        self.declared = list(cfg.get("correctness_checks") or [])
         self.allow_auto: bool | None = None       # repo permits auto-merge
         self.required: list | None = None         # required contexts on base
         self.missing: list | None = None          # required, no check-run
         self.failed: list | None = None           # required, run is red
+        self.pending: list | None = None          # required, not finished
+        self.skipped: list | None = None          # required, skipped, not allowed
+        self.green_by_skip = False                # a may_skip check passed as skipped
+        self.checks: list = []                    # [{name, conclusion, app}] per required
         self.branch_head: str | None = None       # where base was when read
 
 
-def read_state(repo, number, cache=None, stop=None):
+def grade_checks(st, latest):
+    """Sort each required check into exactly one bucket on `st`.
+
+    Three ways a required check used to count as green that it was not:
+
+      * `skipped` passed unconditionally. A path-filtered job that did not
+        run verified nothing, and a required test job that skips on a
+        tests-only diff is the very job that should have run. It now passes
+        only when the repo lists it in `may_skip`, and the PR then records
+        `green_by_skip` so the ledger shows which merges rode on one.
+      * a run still in progress (conclusion null) was neither missing nor
+        failed, so it fell through as green.
+      * duplicate names resolved last-listed-wins; `latest` is newest-wins.
+    """
+    st.missing, st.failed, st.pending, st.skipped = [], [], [], []
+    st.green_by_skip, st.checks = False, []
+    for c in st.required:
+        run = latest.get(c)
+        if run is None:
+            st.missing.append(c)
+            st.checks.append({"name": c, "conclusion": "missing", "app": None})
+            continue
+        concl = run.get("conclusion")
+        st.checks.append({"name": c, "conclusion": concl or run.get("status")
+                          or "pending", "app": run.get("app")})
+        if concl is None:
+            st.pending.append(c)
+        elif concl == "success":
+            pass
+        elif concl == "skipped":
+            if c in st.may_skip:
+                st.green_by_skip = True
+            else:
+                st.skipped.append(c)
+        else:
+            st.failed.append(c)
+
+
+def read_state(repo, number, cache=None, stop=None, cfg=None):
     """Read everything judge() needs about one PR. Raises ReadFailed.
 
     Per-repo facts go through `cache`; per-PR facts are read every time.
@@ -285,6 +389,7 @@ def read_state(repo, number, cache=None, stop=None):
     an ungated repo still costs one call, not five.
     """
     cache = cache if cache is not None else RepoCache()
+    cfg = cfg if cfg is not None else cache.config(repo)
     out = sh_strict("api", f"repos/{repo}/pulls/{number}",
                     "--jq", ".head.sha,.base.ref,.draft,.mergeable_state,.base.sha")
     if out is None:
@@ -293,7 +398,7 @@ def read_state(repo, number, cache=None, stop=None):
     if len(lines) < 5:
         raise ReadFailed(f"{repo}#{number}: short response from pulls endpoint")
     sha, base, draft, mstate, base_sha = lines[:5]
-    st = State(repo, number, sha, base, base_sha, draft, mstate)
+    st = State(repo, number, sha, base, base_sha, draft, mstate, cfg)
 
     # A draft can never merge and can never be armed, however green it is.
     # 22 of 56 open PRs sat in this state while pr-shepherd reported them as
@@ -322,19 +427,10 @@ def read_state(repo, number, cache=None, stop=None):
         return st
 
     bail_if(stop)
-    out = sh_strict("api", f"repos/{repo}/commits/{sha}/check-runs",
-                    "--jq", "[.check_runs[]|{name,conclusion}]")
-    if out is None:
-        raise ReadFailed(f"{repo}#{number}: check-runs not found for {sha[:8]}")
     # An empty list here is a real answer: no check has reported yet. That
     # lands in judge() as "required check(s) not run", which blocks.
-    runs = json.loads(out) if out else []
-    by_name = {r["name"]: r["conclusion"] for r in runs}
-    st.missing = [c for c in st.required if c not in by_name]
-    st.failed = [c for c in st.required
-                 if by_name.get(c) not in (None, "success", "skipped")
-                 and c in by_name]
-    if st.missing or st.failed:
+    grade_checks(st, latest_by_name(check_runs(repo, sha)))
+    if st.missing or st.failed or st.pending or st.skipped:
         return st
 
     # Green -- against which base? Read only for a green PR, so a red one
@@ -367,13 +463,20 @@ def judge(st, moved=frozenset()):
         return False, f"required check(s) not run: {', '.join(st.missing)}"
     if st.failed:
         return False, f"required check(s) red: {', '.join(st.failed)}"
+    if st.skipped:
+        return False, ("required check(s) skipped, and not in this repo's "
+                       f"may_skip: {', '.join(st.skipped)}")
+    if st.pending:
+        return False, f"required check(s) still running: {', '.join(st.pending)}"
     # Checked last so a red PR is still reported as red: that is the finding
     # a reader can act on, and a rebase would only re-run the same red checks.
     stale = stale_base_reason(st.repo, st.base, st.base_sha, moved,
                               head=st.branch_head)
     if stale:
         return False, stale
-    return True, f"green: {', '.join(st.required)}"
+    skipped = [c["name"] for c in st.checks if c["conclusion"] == "skipped"]
+    return True, (f"green: {', '.join(st.required)}"
+                  + (f" (green by skip: {', '.join(skipped)})" if skipped else ""))
 
 
 def check_state(repo, number, moved=frozenset(), cache=None):
@@ -668,6 +771,7 @@ def sweep(deadline=None, clock=time.monotonic, workers=None):
     mode, so a report describes the run a real one would perform.
     """
     data_dirs = load_data_dirs()
+    gate_cfg = load_gate_config()
     vis = repo_visibility() if ONLY_PUBLIC else {}
     s = Sweep()
     workers = workers or DEFAULT_WORKERS
@@ -685,7 +789,7 @@ def sweep(deadline=None, clock=time.monotonic, workers=None):
                   and (not ONLY_PUBLIC
                        or vis.get(pr["repository"]["nameWithOwner"]) == "PUBLIC")]
 
-    cache = RepoCache()
+    cache = RepoCache(gate_cfg)
     stop = threading.Event()
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = [pool.submit(_read, pr, pr["repository"]["nameWithOwner"],

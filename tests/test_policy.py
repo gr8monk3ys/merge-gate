@@ -545,9 +545,10 @@ def _stub_sweep(monkeypatch, prs, read=None, decide=None, enum=None):
                         lambda deadline=None, clock=None, workers=None:
                         enum if enum is not None else _enum(prs))
     monkeypatch.setattr(mg, "load_data_dirs", lambda: {})
+    monkeypatch.setattr(mg, "load_gate_config", lambda: {})
     monkeypatch.setattr(mg, "is_loop_produced", lambda repo, num, pr: True)
     monkeypatch.setattr(mg, "_read", read or
-                        (lambda pr, repo, num, dd, cache=None, stop=None:
+                        (lambda pr, repo, num, dd, cache=None, stop=None, **kw:
                          _Read(pr, repo, num)))
     monkeypatch.setattr(mg, "_decide", decide or
                         (lambda r, s: s.armed.append((r.repo, r.num, "why", r.title))))
