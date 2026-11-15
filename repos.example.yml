@@ -1,8 +1,7 @@
 # Optional operator config, read from ./repos.yml if present.
 #
-# The gate reads exactly one thing from it: `data_dir`, the paths a repo has
-# explicitly opted into as regenerated artifacts (scraper output, rendered
-# data). A PR that touches nothing outside those paths classifies as
+# `data_dir` is the paths a repo has explicitly opted into as regenerated
+# artifacts (scraper output, rendered data). A PR that touches nothing outside those paths classifies as
 # `data-artifact-only` and may auto-merge. Absence means DENY -- an unset
 # field can never yield that shape.
 #
@@ -10,3 +9,19 @@
 repos:
   my-scraper:
     data_dir: ["data", "output"]
+
+  my-app:
+    # Required checks that may pass as `skipped` (path-filtered jobs). Absent:
+    # a skipped required check is not green.
+    may_skip: ["docs-build"]
+    # Check names that ARE correctness gates though their names do not say so.
+    # Without one correctness gate among the required checks, a repo with
+    # auto-merge on is DRIFT and nothing merges.
+    correctness_checks: ["extension"]
+    # Real gate merges per rolling 24h (default MERGE_GATE_MAX_PER_DAY, 3).
+    merge_gate_max_per_day: 2
+    # Hold every gate merge in this repo.
+    merge_gate_paused: false
+    # Revert commit SHAs a human has looked at. A pause raised by a detected
+    # revert of a gate merge clears only when its SHA is listed here.
+    merge_gate_ack_reverts: []
