@@ -810,10 +810,16 @@ def test_invalid_passed_ids_are_no_evidence(ids, expect):
     assert stages is None and expect in why
 
 
-def test_passed_ids_must_match_the_passed_count():
-    st = dict(_stage("u", 3), passed_ids=["t::a", "t::b"])
+def test_passed_ids_cannot_outnumber_passed_tests():
+    st = dict(_stage("u", 1), passed_ids=["t::a", "t::b"])
     stages, why = mg.parse_verify_report(_zip(_report(SHA, [st])), "o/r", SHA)
-    assert stages is None and why == "stage u: 2 passed_ids for 3 passed"
+    assert stages is None and why == "stage u: 2 passed_ids for 1 passed"
+
+
+def test_deduplicated_passed_ids_are_evidence():
+    st = dict(_stage("e2e", 84), passed_ids=["t::a", "t::b"])
+    stages, why = mg.parse_verify_report(_zip(_report(SHA, [st])), "o/r", SHA)
+    assert why is None and stages["e2e"]["passed_ids"] == ["t::a", "t::b"]
 
 
 def test_passed_ids_over_the_cap_are_no_evidence(monkeypatch):
