@@ -770,6 +770,11 @@ def parse_repos_yml(path=None):
             # Only a literal `true` opts in; anything else is the strict default.
             "allow_tests_only": body.get("allow_tests_only") is True,
             "require_verify_evidence": body.get("require_verify_evidence") is True,
+            # The one workflow whose runs may supply a verify-report, by path
+            # (".github/workflows/ci.yml"). Absent: no evidence, ever.
+            "verify_workflow": (body.get("verify_workflow")
+                                if isinstance(body.get("verify_workflow"), str)
+                                else None),
         }
     return out
 
@@ -790,7 +795,8 @@ def load_data_dirs():
 
 GATE_CONFIG_FIELDS = ("may_skip", "correctness_checks", "merge_gate_max_per_day",
                       "merge_gate_paused", "merge_gate_ack_reverts",
-                      "allow_tests_only", "require_verify_evidence")
+                      "allow_tests_only", "require_verify_evidence",
+                      "verify_workflow")
 
 
 def load_gate_config():
@@ -813,6 +819,12 @@ def load_gate_config():
       require_verify_evidence true: EVERY shape the gate merges here needs a
                               verify-report at head and base, with no failed
                               test at head and no stage missing from it.
+      verify_workflow         the workflow path (".github/workflows/ci.yml")
+                              whose runs alone may supply a verify-report: a
+                              successful pull_request run for a head, a
+                              successful push run of the base branch for a
+                              base. Absent: no evidence, so both flags above
+                              route everything they cover.
       merge_gate_ack_reverts  revert commit SHAs a human has looked at. A
                               pause raised by a detected revert clears only
                               when its SHA is listed here.

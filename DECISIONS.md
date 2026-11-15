@@ -688,3 +688,41 @@ Choices, each the strict side of a fork:
 The report is produced by the workflow that runs the code under test. It is
 trusted as far as the step that writes it: derived from the runner's result
 files after the tests, not writable by the tests themselves.
+
+### 39. Evidence has a fixed origin, and counts need names (0.10.1)
+
+A security review of 0.10.0 found two holes.
+
+**Any run could supply the report.** 0.10.0 took the newest completed run on
+the sha that carried a `verify-report`, from any workflow and any event, and
+skipped over runs without one. So a second workflow, a `workflow_dispatch`
+run or a failed run's artifact could stand in, and an older run could stand
+in for a newer one that had none. Now `repos.yml` names the one workflow
+(`verify_workflow`, a path), the event is fixed (`pull_request` for a head,
+`push` on the base branch for a base), and only the newest completed run of
+that workflow for that sha and event is looked at. It must have succeeded and
+carry a valid report; if not, that is no evidence. Absent `verify_workflow`
+is no evidence, not "any workflow": the strict default.
+
+**Counts can stay level while tests are lost.** A new file that disables an
+old test and adds one of its own keeps every count where it was; a skip
+added at head moves a test from `passed` to `skipped`. So: `skipped` may not
+rise per stage, and the report may carry `passed_ids` per stage (additive to
+schema 1 — an old report without it is still valid). Where both sides carry
+them, every base ID must pass at head, and the reason names the first one
+missing. "New IDs >= new cases in the diff" needs no separate check: with
+base IDs ⊆ head IDs, one ID per pass, no failures and no rise in skipped, the
+count of new IDs is at least the growth in total tests, which is already
+required. Without IDs on both sides the count rules apply, plus the skipped
+rule. IDs are validated strictly (non-empty strings, sorted, unique, exactly
+`passed` of them, at most 200,000 per report) and never go into the ledger.
+
+**What remains.** The report is still produced by CI that runs the PR's own
+code. A `pull_request` run executes the PR, and a PR can write any report it
+likes or change the step that writes it — `verify_workflow` fixes which
+workflow is asked, not what its code does at that commit. So this defends
+against accidental weakening by an agent, not against a deliberately
+malicious PR. A report produced outside the PR's reach (a `workflow_run`
+from the default branch re-running the tests, or an external runner) would
+close that; it was not built, and tests-only auto-merge stays opt-in per repo
+for exactly this reason.

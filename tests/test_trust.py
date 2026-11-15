@@ -157,20 +157,23 @@ def test_gate_config_is_read_from_repos_yml(tmp_path, monkeypatch):
     pytest.importorskip("yaml")
     y = tmp_path / "repos.yml"
     y.write_text("repos:\n"
-                 "  a: { may_skip: [test], merge_gate_max_per_day: 1 }\n"
+                 "  a: { may_skip: [test], merge_gate_max_per_day: 1,\n"
+                 "       verify_workflow: .github/workflows/ci.yml }\n"
                  "  b: { merge_gate_paused: true, merge_gate_ack_reverts: [abc1234] }\n"
                  "  c: {}\n")
     monkeypatch.setenv("GATE_REPOS_YML", str(y))
     cfg = cp.load_gate_config()
     assert cfg["a"]["may_skip"] == ["test"]
     assert cfg["a"]["merge_gate_max_per_day"] == 1
+    assert cfg["a"]["verify_workflow"] == ".github/workflows/ci.yml"
     assert cfg["b"]["merge_gate_paused"] is True
     assert cfg["b"]["merge_gate_ack_reverts"] == ["abc1234"]
     # Absent is the strict value, never a permissive one.
     assert cfg["c"] == {"may_skip": [], "correctness_checks": [],
                         "merge_gate_max_per_day": None,
                         "merge_gate_paused": False, "merge_gate_ack_reverts": [],
-                        "allow_tests_only": False, "require_verify_evidence": False}
+                        "allow_tests_only": False, "require_verify_evidence": False,
+                        "verify_workflow": None}
 
 
 def test_a_missing_repos_yml_yields_no_gate_config(tmp_path, monkeypatch):
@@ -702,13 +705,23 @@ def _zip(doc, name="verify-report.json", extra=None):
     return buf.getvalue()
 
 
-# One completed run per sha, run id = "run-<sha>", artifact id = "art-<sha>".
-# A run on the base sha is a push to main; on any other sha, a PR branch.
+WF = ".github/workflows/ci.yml"
+
+
+def _wf_run(id, sha=None, event="pull_request", branch="x", conclusion="success",
+            updated="2026-11-15T00:00:00Z", path=WF):
+    return {"id": id, "head_sha": sha or SHA, "head_branch": branch, "updated_at": updated,
+            "path": path, "event": event, "conclusion": conclusion}
+
+
+# One completed run per sha, run id = "run-<sha>", artifact id = "art-<sha>",
+# of the declared workflow and the event asked for. A run on the base sha is
+# a push to main; on any other sha, a PR branch.
 def _runs_answer(joined):
     sha = joined.split("head_sha=")[1].split("&")[0]
+    event = joined.split("event=")[1].split("&")[0]
     branch = "main" if sha.startswith("base") else "auto/x"
-    return json.dumps([{"id": f"run-{sha}", "head_sha": sha, "head_branch": branch,
-                        "updated_at": "2026-11-15T00:00:00Z"}])
+    return json.dumps([_wf_run(f"run-{sha}", sha, event, branch)])
 
 
 def _arts_answer(joined):
@@ -769,6 +782,47 @@ def test_an_invalid_report_is_no_evidence(doc, expect):
     assert stages is None and expect in why
 
 
+def _ids_stage(name, ids, **kw):
+    return dict(_stage(name, len(ids)), passed_ids=ids, **kw)
+
+
+def test_passed_ids_parse_with_the_stage():
+    stages, why = mg.parse_verify_report(
+        _zip(_report(SHA, [_ids_stage("u", ["t::a", "t::b"]), _stage("e2e", 1)])),
+        "o/r", SHA)
+    assert why is None
+    assert stages["u"]["passed_ids"] == ["t::a", "t::b"]
+    assert "passed_ids" not in stages["e2e"]
+
+
+@pytest.mark.parametrize("ids, expect", [
+    ("t::a", "passed_ids is not a list"),
+    ({"t::a": 1}, "passed_ids is not a list"),
+    (["t::a", ""], "non-empty strings"),
+    (["t::a", 3], "non-empty strings"),
+    (["t::a", None], "non-empty strings"),
+    (["t::b", "t::a"], "not sorted and unique"),
+    (["t::a", "t::a"], "not sorted and unique"),
+])
+def test_invalid_passed_ids_are_no_evidence(ids, expect):
+    st = dict(_stage("u", 2), passed_ids=ids)
+    stages, why = mg.parse_verify_report(_zip(_report(SHA, [st])), "o/r", SHA)
+    assert stages is None and expect in why
+
+
+def test_passed_ids_must_match_the_passed_count():
+    st = dict(_stage("u", 3), passed_ids=["t::a", "t::b"])
+    stages, why = mg.parse_verify_report(_zip(_report(SHA, [st])), "o/r", SHA)
+    assert stages is None and why == "stage u: 2 passed_ids for 3 passed"
+
+
+def test_passed_ids_over_the_cap_are_no_evidence(monkeypatch):
+    monkeypatch.setattr(mg, "VERIFY_MAX_IDS", 3)
+    doc = _report(SHA, [_ids_stage("u", ["a", "b"]), _ids_stage("v", ["c", "d"])])
+    stages, why = mg.parse_verify_report(_zip(doc), "o/r", SHA)
+    assert stages is None and why == "more than 3 passed_ids"
+
+
 def test_an_artifact_that_is_not_exactly_one_report_is_no_evidence():
     ok = _report(SHA, [_stage("u", 1)])
     assert "exactly" in mg.parse_verify_report(_zip(ok, extra=["b.json"]), "o/r", SHA)[1]
@@ -777,64 +831,120 @@ def test_an_artifact_that_is_not_exactly_one_report_is_no_evidence():
     assert "unreadable" in mg.parse_verify_report(_zip("{oops"), "o/r", SHA)[1]
 
 
-def test_the_newest_run_carrying_the_artifact_is_read(monkeypatch):
-    runs = [{"id": 1, "head_sha": SHA, "head_branch": "x", "updated_at": "2026-11-01T00:00:00Z"},
-            {"id": 3, "head_sha": SHA, "head_branch": "x", "updated_at": "2026-11-03T00:00:00Z"},
-            {"id": 2, "head_sha": SHA, "head_branch": "x", "updated_at": "2026-11-02T00:00:00Z"}]
-    arts = {1: [{"id": 11, "name": "verify-report", "expired": False}],
-            2: [{"id": 12, "name": "verify-report", "expired": False}],
-            3: [{"id": 13, "name": "coverage", "expired": False}]}
-    monkeypatch.setattr(mg, "sh_strict", _gh([
-        ("actions/runs?head_sha=" + SHA + "&status=completed", json.dumps(runs)),
-        ("runs/1/artifacts", json.dumps(arts[1])),
-        ("runs/2/artifacts", json.dumps(arts[2])),
-        ("runs/3/artifacts", json.dumps(arts[3]))]))
+def _serve_runs(monkeypatch, runs, arts):
+    """sh_strict for the runs listing and each run's artifacts; returns the
+    downloads made, each answering a valid report for SHA."""
+    monkeypatch.setattr(mg, "sh_strict", _gh(
+        [("actions/runs?head_sha=", json.dumps(runs))]
+        + [(f"runs/{i}/artifacts", json.dumps(a)) for i, a in arts.items()]))
     got = []
     monkeypatch.setattr(mg.gh_transport, "download", lambda p: got.append(p) or
                         mg.gh_transport.Result(0, _zip(_report(SHA, [_stage("u", 4)])), ""))
-    rep, why = mg.verify_report("o/r", SHA)
-    assert why is None and rep["run"] == 2 and rep["stages"]["u"]["tests"] == 4
+    return got
+
+
+def _art(id, name="verify-report"):
+    return [{"id": id, "name": name, "expired": False}]
+
+
+def test_the_newest_run_of_the_declared_workflow_and_event_is_read(monkeypatch):
+    runs = [_wf_run(1, updated="2026-11-01T00:00:00Z"),
+            _wf_run(2, updated="2026-11-02T00:00:00Z"),
+            # Newer, but not the declared workflow, or not the event asked for.
+            _wf_run(3, updated="2026-11-03T00:00:00Z", path=".github/workflows/other.yml"),
+            _wf_run(4, updated="2026-11-04T00:00:00Z", event="workflow_dispatch")]
+    got = _serve_runs(monkeypatch, runs, {i: _art(10 + i) for i in (1, 2, 3, 4)})
+    rep, why = mg.verify_report("o/r", SHA, WF, "pull_request")
+    assert why is None and rep["stages"]["u"]["tests"] == 4
+    assert (rep["run"], rep["workflow"], rep["event"]) == (2, WF, "pull_request")
     assert got == ["repos/o/r/actions/artifacts/12/zip"]
 
 
-def test_base_evidence_must_come_from_a_run_of_the_base_branch(monkeypatch):
-    runs = [{"id": 1, "head_sha": SHA, "head_branch": "auto/x", "updated_at": "z"}]
-    monkeypatch.setattr(mg, "sh_strict", _gh([("actions/runs", json.dumps(runs))]))
-    rep, why = mg.verify_report("o/r", SHA, "main")
-    assert rep is None and why == "no completed run on main uploaded verify-report"
+def test_the_runs_read_asks_for_the_event(monkeypatch):
+    reads = []
+    monkeypatch.setattr(mg, "sh_strict", lambda *a: reads.append(" ".join(a)) or "[]")
+    mg.verify_report("o/r", SHA, WF, "push", "main")
+    assert f"head_sha={SHA}&event=push&status=completed" in reads[0]
+
+
+def test_only_a_run_of_the_declared_workflow_counts(monkeypatch):
+    _serve_runs(monkeypatch, [_wf_run(1, path=".github/workflows/evil.yml")], {1: _art(11)})
+    rep, why = mg.verify_report("o/r", SHA, WF, "pull_request")
+    assert rep is None and why == f"no completed {WF} pull_request run"
+
+
+@pytest.mark.parametrize("conclusion", ["failure", "cancelled", "skipped", None])
+def test_a_newest_run_that_did_not_succeed_is_no_evidence_even_with_an_older_success(
+        monkeypatch, conclusion):
+    runs = [_wf_run(1, updated="2026-11-01T00:00:00Z"),
+            _wf_run(2, updated="2026-11-02T00:00:00Z", conclusion=conclusion)]
+    got = _serve_runs(monkeypatch, runs, {1: _art(11), 2: _art(12)})
+    rep, why = mg.verify_report("o/r", SHA, WF, "pull_request")
+    assert rep is None and why == f"newest {WF} pull_request run 2 concluded {conclusion}"
+    assert got == []
+
+
+def test_a_newest_run_without_the_artifact_is_not_rescued_by_an_older_run(monkeypatch):
+    runs = [_wf_run(1, updated="2026-11-01T00:00:00Z"),
+            _wf_run(2, updated="2026-11-02T00:00:00Z")]
+    got = _serve_runs(monkeypatch, runs, {1: _art(11), 2: _art(12, "coverage")})
+    rep, why = mg.verify_report("o/r", SHA, WF, "pull_request")
+    assert rep is None and why == "run 2 has 0 verify-report artifacts"
+    assert got == []
+
+
+def test_a_newest_run_with_an_invalid_report_is_not_rescued_by_an_older_run(monkeypatch):
+    runs = [_wf_run(1, updated="2026-11-01T00:00:00Z"),
+            _wf_run(2, updated="2026-11-02T00:00:00Z")]
+    _serve_runs(monkeypatch, runs, {1: _art(11), 2: _art(12)})
+    monkeypatch.setattr(mg.gh_transport, "download", lambda p: mg.gh_transport.Result(
+        0, _zip(_report(SHA, [_stage("u", 4)], schema=2)) if "/12/" in p
+        else _zip(_report(SHA, [_stage("u", 4)])), ""))
+    rep, why = mg.verify_report("o/r", SHA, WF, "pull_request")
+    assert rep is None and why == "run 2: schema 2, want 1"
+
+
+def test_base_evidence_must_come_from_a_push_run_of_the_base_branch(monkeypatch):
+    _serve_runs(monkeypatch, [_wf_run(1, event="push", branch="auto/x")], {1: _art(11)})
+    rep, why = mg.verify_report("o/r", SHA, WF, "push", "main")
+    assert rep is None and why == f"no completed {WF} push on main run"
 
 
 @pytest.mark.parametrize("art, err, expect", [
     ({"expired": True}, None, "has expired"),
-    ({"size_in_bytes": 10 << 20}, None, "too large"),
+    ({"size_in_bytes": mg.VERIFY_MAX_BYTES + 1}, None, "too large"),
     ({}, "gh: Artifact has expired (HTTP 410)", "could not be downloaded"),
 ])
 def test_an_unusable_artifact_is_no_evidence(monkeypatch, art, err, expect):
-    runs = [{"id": 1, "head_sha": SHA, "head_branch": "x", "updated_at": "z"}]
+    runs = [_wf_run(1)]
     monkeypatch.setattr(mg, "sh_strict", _gh([
         ("actions/runs?", json.dumps(runs)),
         ("runs/1/artifacts", json.dumps([dict({"id": 5, "name": "verify-report",
                                                "expired": False}, **art)]))]))
     monkeypatch.setattr(mg.gh_transport, "download",
                         lambda p: mg.gh_transport.Result(1, b"", err or "unexpected"))
-    rep, why = mg.verify_report("o/r", SHA)
+    rep, why = mg.verify_report("o/r", SHA, WF, "pull_request")
     assert rep is None and expect in why
 
 
 def test_a_download_github_did_not_answer_is_no_verdict_not_no_evidence(monkeypatch):
-    runs = [{"id": 1, "head_sha": SHA, "head_branch": "x", "updated_at": "z"}]
+    runs = [_wf_run(1)]
     monkeypatch.setattr(mg, "sh_strict", _gh([
         ("actions/runs?", json.dumps(runs)),
         ("runs/1/artifacts", json.dumps([{"id": 5, "name": "verify-report"}]))]))
     monkeypatch.setattr(mg.gh_transport, "download",
                         lambda p: mg.gh_transport.Result(1, b"", "gh: HTTP 502"))
     with pytest.raises(mg.ReadFailed):
-        mg.verify_report("o/r", SHA)
+        mg.verify_report("o/r", SHA, WF, "pull_request")
 
 
 def _c(tests, failed=0, skipped=0):
     return {"tests": tests, "passed": tests - failed - skipped,
             "failed": failed, "skipped": skipped}
+
+
+def _i(ids):
+    return dict(_c(len(ids)), passed_ids=ids)
 
 
 @pytest.mark.parametrize("head, base, full, new, expect", [
@@ -850,8 +960,31 @@ def _c(tests, failed=0, skipped=0):
      "total tests grew by 1, need the 3 new test case(s) the diff adds"),
     ({"u": _c(10)}, {"u": _c(10)}, True, None,
      "total tests grew by 0, need at least one (new cases could not be counted)"),
+    # A rise in skipped hides a test as surely as a drop in passed does.
+    ({"u": _c(12, skipped=1)}, {"u": _c(10)}, True, 1, "stage u: skipped 0 -> 1 at head"),
+    ({"u": _i(["a", "b", "c"])}, {"u": _i(["a", "b"])}, True, 1, None),
+    ({"u": _i(["a", "c", "d"])}, {"u": _i(["a", "b"])}, True, 1,
+     "stage u: b passed at base but not at head"),
+    ({"u": _i(["a", "x", "y"])}, {"u": _i(["a", "b", "c"])}, True, None,
+     "stage u: b passed at base but not at head (+1 more)"),
+    # Counts grew enough, but a base test was swapped out for new ones.
+    ({"u": _i(["a", "b", "x", "y"])}, {"u": _i(["a", "b", "c"])}, True, 1,
+     "stage u: c passed at base but not at head"),
+    ({"u": _i(["a", "b", "x"]), "v": _i(["d", "e"])},
+     {"u": _i(["a", "b"]), "v": _i(["d", "e"])}, True, 2,
+     "total tests grew by 1, need the 2 new test case(s) the diff adds"),
+    ({"u": _i(["a", "b", "x", "y"]), "v": _i(["e", "f"])},
+     {"u": _i(["a", "b"]), "v": _i(["d", "e"])}, True, 2,
+     "stage v: d passed at base but not at head"),
+    # A stage without IDs on either side: count rules for it, IDs for the rest.
+    ({"u": _i(["a", "b"]), "v": _c(6)}, {"u": _i(["a", "c"]), "v": _c(5)}, True, 1,
+     "stage u: c passed at base but not at head"),
+    ({"u": _i(["a", "b"]), "v": _c(6)}, {"u": _i(["a", "b"]), "v": _c(5)}, True, 1, None),
+    ({"u": _i(["a", "b"]), "v": _c(6, skipped=2)}, {"u": _i(["a", "b"]), "v": _c(5, skipped=1)},
+     True, 1, "stage v: skipped 1 -> 2 at head"),
     # Other shapes: only failures and vanished stages count; a drop does not.
     ({"u": _c(5)}, {"u": _c(10)}, False, None, None),
+    ({"u": _c(5, skipped=3)}, {"u": _c(10)}, False, None, None),
     ({"u": _c(5, failed=1)}, {"u": _c(10)}, False, None, "stage u: 1 failed at head"),
     ({"x": _c(5)}, {"u": _c(10)}, False, None, "stage(s) u ran at base but not at head"),
 ])
@@ -991,7 +1124,7 @@ def test_a_file_with_no_patch_or_an_unread_diff_vetoes():
 
 def OPT_IN():
     """A sweep cache for a repo that opted in to tests-only auto-merge."""
-    return mg.RepoCache({"r": {"allow_tests_only": True}})
+    return mg.RepoCache({"r": {"allow_tests_only": True, "verify_workflow": WF}})
 
 
 def _tests_only(monkeypatch, files, head="hA", tree=None, paths=None,
@@ -1137,14 +1270,40 @@ def _real(monkeypatch):
 
 
 def test_a_tests_only_merge_records_the_counts_it_rode_on(monkeypatch):
-    pr, _ = _tests_only(monkeypatch, [_new("tests/test_p.py")], head="hA")
+    pr, _ = _tests_only(monkeypatch, [_new("tests/test_p.py")], head="hA",
+                        head_stages=[_ids_stage("unit", [f"t{i:02}" for i in range(11)])],
+                        base_stages=[_ids_stage("unit", [f"t{i:02}" for i in range(10)])])
     writes = _real(monkeypatch)
     s = mg.Sweep()
     mg._evaluate(pr, "o/r", 9, {}, s, OPT_IN())
     assert s.armed and _merges(writes)
     v = _rows()[-1]["artifacts"]["verify"]
-    assert v["head"] == {"run": "run-hA", "stages": {"unit": _c(11)}}
-    assert v["base"] == {"run": "run-base0", "stages": {"unit": _c(10)}}
+    # Provenance, and counts only: the ledger is not a list of test IDs.
+    assert v["head"] == {"run": "run-hA", "workflow": WF, "event": "pull_request",
+                         "stages": {"unit": _c(11)}}
+    assert v["base"] == {"run": "run-base0", "workflow": WF, "event": "push",
+                         "stages": {"unit": _c(10)}}
+
+
+def test_a_tests_only_pr_that_lost_a_passing_test_id_routes_naming_it(monkeypatch):
+    pr, _ = _tests_only(monkeypatch, [_new("tests/test_p.py")], head="hA",
+                        head_stages=[_ids_stage("unit", ["t::a", "t::new1", "t::new2"])],
+                        base_stages=[_ids_stage("unit", ["t::a", "t::b"])])
+    s = mg.Sweep()
+    mg._evaluate(pr, "o/r", 9, {}, s, OPT_IN())
+    assert s.armed == []
+    assert s.review[0][2] == "VERIFY — stage unit: t::b passed at base but not at head"
+
+
+def test_evidence_without_a_declared_verify_workflow_is_none(monkeypatch):
+    pr, _ = _tests_only(monkeypatch, [_new("tests/test_p.py")], head="hA")
+    monkeypatch.setattr(mg.gh_transport, "download",
+                        lambda p: pytest.fail("read evidence with no declared workflow"))
+    s = mg.Sweep()
+    mg._evaluate(pr, "o/r", 9, {}, s, mg.RepoCache({"r": {"allow_tests_only": True}}))
+    assert s.armed == []
+    assert s.review[0][2] == ("VERIFY — no evidence: verify_workflow is not set for "
+                              "this repo in repos.yml")
 
 
 def test_a_tests_only_pr_that_ran_fewer_tests_routes_with_the_stage(monkeypatch):
@@ -1215,7 +1374,7 @@ def _lockfile_repo(monkeypatch, cfg, head_stages, base_stages=None):
     if base_stages is not None:
         by["base0"] = base_stages
     _serve_evidence(monkeypatch, by)
-    return mg.RepoCache({"r": cfg})
+    return mg.RepoCache({"r": dict(cfg, verify_workflow=WF)})
 
 
 def test_require_verify_evidence_routes_any_shape_with_a_failed_test(monkeypatch):

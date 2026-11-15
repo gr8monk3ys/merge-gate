@@ -3,6 +3,37 @@
 Releases before 0.9.0 are described by their commit and PR messages;
 `DECISIONS.md` tells why each rule exists.
 
+## 0.10.1 — evidence provenance and test identity
+
+### Security
+
+- **A verify-report counts only from the declared workflow, event and
+  newest run.** New per-repo `repos.yml` field `verify_workflow` (a path,
+  e.g. `.github/workflows/ci.yml`). The head's report must come from the
+  newest completed `pull_request` run of that workflow on the head sha; the
+  base's from the newest completed `push` run of it on the base branch. That
+  run must have concluded `success` and carry exactly one valid report; an
+  older run is never used in its place. Without `verify_workflow` there is no
+  evidence.
+- **Tests-only: `skipped` may not rise in any stage**, and stages may carry
+  an optional `passed_ids` (sorted, unique, non-empty strings, one per passed
+  test; additive to schema 1). When head and base both carry them, every ID
+  that passed at base must pass at head; the reason names the first missing
+  one. Without IDs on both sides, the count rules apply plus the skipped rule.
+  Over 200,000 IDs in a report is no evidence.
+
+### Changed
+
+- **Opted-in repos must add `verify_workflow`** or their tests-only (and
+  `require_verify_evidence`) PRs route with `VERIFY — no evidence:
+  verify_workflow is not set for this repo in repos.yml`.
+- Ledger `artifacts.verify` now records each side's `run`, `workflow` and
+  `event`; `passed_ids` are never written to it.
+- A report may be up to 32 MiB (was 1 MiB) to hold test IDs.
+- README and DECISIONS §39 state the residual limit plainly: the report comes
+  from CI running the PR's own code, so it guards against accidental
+  weakening, not a deliberately malicious PR.
+
 ## 0.10.0 — test-count evidence
 
 ### Added
