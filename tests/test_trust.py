@@ -673,7 +673,11 @@ def test_branch_commits_reads_every_page(monkeypatch):
     assert "--paginate" in seen[0] and "since=2026-11-01T00:00:00Z" in seen[0][1]
 
 
-# --- item 5: tests-only is judged on content --------------------------------
+# --- item 5: tests-only merges brand-new test files only --------------------
+
+def _new(name, patch="@@ -0,0 +1 @@\n+def test_p():\n+    assert p()\n"):
+    return {"filename": name, "status": "added", "patch": patch}
+
 
 def _f(name, patch="", status="modified", prev=None):
     d = {"filename": name, "status": status, "patch": patch}
@@ -682,206 +686,191 @@ def _f(name, patch="", status="modified", prev=None):
     return d
 
 
-def test_a_test_that_only_adds_assertions_passes():
-    patch = "@@ -1,2 +1,4 @@\n def test_x():\n+    y = f()\n+    assert y == 2\n     assert f()\n"
-    assert cp.tests_only_veto([_f("tests/test_x.py", patch)]) is None
+EXISTING = ["src/p.py", "tests/test_q.py", "src/a.test.ts"]
 
 
-def test_a_deleted_test_file_is_rejected():
-    why = cp.tests_only_veto([_f("tests/test_x.py", "@@ -1 +0,0 @@\n-assert 1", "removed")])
-    assert why == "deletes test file tests/test_x.py"
+def test_brand_new_test_files_pass():
+    files = [_new("tests/test_p.py"), _new("src/b.test.ts", "@@ -0,0 +1 @@\n+expect(b()).toBe(1)\n")]
+    assert cp.tests_only_veto(files, EXISTING) is None
 
 
-@pytest.mark.parametrize("line,label", [
-    ("@pytest.mark.skip(reason='flaky')", "mark.skip"),
-    ("@pytest.mark.skipif(True, reason='x')", "mark.skip"),
-    ("@pytest.mark.xfail", "mark.skip"),
-    ("    pytest.mark.skip", "mark.skip"),                    # no @
-    ("@mark.skip", "mark.skip"),                             # from pytest import mark
-    ("pytestmark = pytest.mark.slow", "pytestmark ="),        # module-wide marker
-    ("@unittest.expectedFailure", "unittest skip"),
-    ("    unittest.skipIf(True, 'x')(test_x)", "unittest skip"),
-    ("@skipIf(sys.platform == 'win32', 'x')", "unittest skip"),  # from unittest import skipIf
-    ("test.todo('later')", "it/describe/test.skip"),
-    ("xdescribe('suite', () => {", "xit/xdescribe"),
-    ("    pytest.skip('later')", "pytest.skip("),
-    ("    pytest.importorskip('numpy')", "pytest.skip("),
-    ("it.skip('renders', () => {", "it/describe/test.skip"),
-    ("describe.skip('suite', () => {", "it/describe/test.skip"),
-    ("describe.only('suite', () => {", "it/describe/test.skip"),
-    ("test.only('x', () => {})", "it/describe/test.skip"),
-    ("  suite.skip(() => {})", "it/describe/test.skip"),
-    ("xit('renders', () => {", "xit/xdescribe"),
-    ("fdescribe('suite', () => {", "xit/xdescribe"),
-    ("@unittest.skip('x')", "unittest skip"),
-    ("        self.skipTest('x')", "unittest skip"),
-    ("    t.Skip(\"later\")", "t.Skip("),
-    ("#[ignore]", "#[ignore]"),
+@pytest.mark.parametrize("status", ["modified", "changed", "removed"])
+def test_a_change_to_an_existing_test_file_is_never_auto_merged(status):
+    # Even a pure addition to an existing file: an early `return` or a
+    # shadowing duplicate inside it is not something a pattern can rule out.
+    why = cp.tests_only_veto([_f("tests/test_q.py", "@@ -1 +1,2 @@\n+    assert q()\n",
+                                 status)], EXISTING)
+    assert why == (f"{status} existing test file tests/test_q.py: only brand-new "
+                   "test files auto-merge")
+
+
+@pytest.mark.parametrize("status,prev,name", [
+    ("renamed", "tests/test_parser.py", "tests/parser.py"),
+    ("renamed", "src/a.test.ts", "src/a.spec.ts"),
+    ("copied", "tests/test_a.py", "tests/test_b.py"),
 ])
-def test_an_added_disabling_marker_is_rejected_and_named(line, label):
-    why = cp.tests_only_veto([_f("src/a.test.ts", f"@@ -1 +1,2 @@\n+{line}\n")])
-    assert why is not None and why.startswith("adds a test-disabling marker (")
-    assert label in why and "src/a.test.ts" in why and line.strip()[:20] in why
-
-
-def test_any_removed_line_is_a_veto_even_a_marker():
-    # Deny by default: telling a harmless removal from a weakening one needs
-    # the test's meaning, which a diff does not carry.
-    patch = "@@ -1,2 +1 @@\n-@pytest.mark.skip(reason='flaky')\n def test_x():\n"
-    why = cp.tests_only_veto([_f("tests/test_x.py", patch)])
-    assert why == ("removes a line from existing test code in tests/test_x.py: "
-                   "@pytest.mark.skip(reason='flaky')")
-
-
-def test_an_edited_expected_value_is_a_removal_too():
-    patch = "@@ -1 +1 @@\n-    assert total() == 3\n+    assert total() == 4\n"
-    why = cp.tests_only_veto([_f("tests/test_x.py", patch)])
-    assert why.startswith("removes an assertion from existing test code in tests/test_x.py")
-
-
-def test_removed_blank_lines_are_not_removals():
-    patch = "@@ -1,3 +1,3 @@\n-\n+    assert y\n def test_x():\n"
-    assert cp.tests_only_veto([_f("tests/test_x.py", patch)]) is None
-
-
-def test_words_that_merely_contain_skip_are_not_markers():
-    patch = "@@ -1 +1,2 @@\n+    skip_empty = True\n+    assert parse(skip_empty)\n"
-    assert cp.tests_only_veto([_f("tests/test_x.py", patch)]) is None
+def test_a_renamed_or_copied_test_file_is_vetoed(status, prev, name):
+    why = cp.tests_only_veto([_f(name, "", status, prev=prev)], EXISTING)
+    assert why == (f"{status} existing test file {prev} -> {name}: only brand-new "
+                   "test files auto-merge")
 
 
 @pytest.mark.parametrize("path", [
     "conftest.py", "tests/conftest.py", "e2e/login.spec.ts",
     "apps/web/e2e/login.spec.ts", "playwright/fixtures.ts", "cypress/e2e/a.cy.ts",
-    "playwright.config.ts", "web/cypress.config.js",
+    "playwright.config.ts", "web/cypress.config.js", "tests/pytest.ini",
+    "tests/jest.config.js", "web/vitest.config.ts", "tests/setupTests.ts",
 ])
-def test_harness_and_e2e_paths_are_rejected(path):
-    why = cp.tests_only_veto([_f(path, "@@ -1 +1 @@\n+assert 1\n")])
-    assert why == f"touches test harness/config: {path}"
+def test_new_harness_and_config_files_are_rejected(path):
+    assert cp.tests_only_veto([_new(path)], EXISTING) == f"touches test harness/config: {path}"
 
 
-def test_a_rename_out_of_the_harness_names_the_harness():
-    why = cp.tests_only_veto([_f("tests/helpers.py", "", "renamed", prev="tests/conftest.py")])
-    assert why == "touches test harness/config: tests/conftest.py"
+def test_a_new_file_named_like_an_existing_one_is_rejected():
+    why = cp.tests_only_veto([_new("tests/unit/test_q.py")], EXISTING)
+    assert why == "new test file tests/unit/test_q.py shares its name with tests/test_q.py"
 
 
-def test_removed_assertions_are_not_netted_against_added_ones():
-    # Moving an assertion from one file to another used to net to zero.
-    a = _f("tests/test_a.py", "@@ -1 +0,0 @@\n-    expect(b).toBe(2)\n")
-    b = _f("tests/test_b.py", "@@ -0,0 +1,2 @@\n+    assert y\n+    assert z\n")
-    why = cp.tests_only_veto([b, a])
-    assert why == ("removes an assertion from existing test code in "
-                   "tests/test_a.py: expect(b).toBe(2)")
+def test_two_new_files_with_one_name_are_rejected():
+    why = cp.tests_only_veto([_new("tests/a/test_z.py"), _new("tests/b/test_z.py")], EXISTING)
+    assert why == "new test file tests/b/test_z.py shares its name with tests/a/test_z.py"
 
 
-@pytest.mark.parametrize("status,prev,name", [
-    ("renamed", "tests/test_parser.py", "tests/parser.py"),     # drops out of collection
-    ("renamed", "src/a.test.ts", "src/a.spec.ts"),              # even test -> test
-    ("copied", "tests/test_a.py", "tests/test_b.py"),
+def test_a_duplicate_test_name_inside_a_new_file_is_rejected():
+    patch = "@@ -0,0 +1,4 @@\n+def test_p():\n+    assert 0\n+def test_p():\n+    assert 1\n"
+    why = cp.tests_only_veto([_new("tests/test_p.py", patch)], EXISTING)
+    assert why == "defines test_p twice in tests/test_p.py; the second shadows the first"
+
+
+def test_an_unlisted_base_tree_vetoes():
+    why = cp.tests_only_veto([_new("tests/test_p.py")], None)
+    assert why.startswith("could not list the base tree")
+
+
+def test_a_non_test_path_listed_as_added_is_rejected():
+    assert cp.tests_only_veto([_new("src/p2.py")], EXISTING) == "src/p2.py is not a test path"
+
+
+def test_an_added_file_whose_patch_removes_lines_is_not_new():
+    why = cp.tests_only_veto([_new("tests/test_p.py", "@@ -1 +1 @@\n-x\n+y\n")], EXISTING)
+    assert why == "tests/test_p.py is listed as added but its patch removes lines"
+
+
+@pytest.mark.parametrize("line", [
+    "@pytest.mark.skip(reason='flaky')", "    pytest.mark.skip", "@mark.xfail",
+    "pytestmark = [slow]", "    return pytestmark",
+    # aliased: none of these names the marker by its usual spelling
+    "from pytest import mark as m", "@m.skip", "sk = pytest.mark.skip",
+    "@pt.mark.skipif(True, reason='x')", "    pt.skip('later')",
+    "from unittest import SkipTest", "    raise SkipTest('later')",
+    "    raise pytest.skip.Exception('later')",
+    "__test__ = False", "    pytest.skip('later')", "    pytest.importorskip('numpy')",
+    "it.skip('renders', () => {", "describe.only('suite', () => {",
+    "test.todo('later')", "xit('renders', () => {", "fdescribe('s', () => {",
+    "@unittest.expectedFailure", "@skipIf(True, 'x')", "        self.skipTest('x')",
+    '    t.Skip("later")', "#[ignore]",
 ])
-def test_a_renamed_or_copied_test_file_is_vetoed(status, prev, name):
-    why = cp.tests_only_veto([_f(name, "", status, prev=prev)])
-    assert why == f"{status} test file {prev} -> {name}"
+def test_a_disabling_marker_in_a_new_file_is_caught(line):
+    why = cp.tests_only_veto([_new("tests/test_p.py", f"@@ -0,0 +1 @@\n+{line}\n")], EXISTING)
+    assert why is not None and why.startswith("adds a test-disabling marker (")
+    assert "tests/test_p.py" in why
+
+
+def test_ordinary_test_code_is_not_a_marker():
+    patch = ("@@ -0,0 +1,3 @@\n+def test_parse():\n+    skip_empty = True\n"
+             "+    assert parse(skip_empty) == []\n")
+    assert cp.tests_only_veto([_new("tests/test_parse.py", patch)], EXISTING) is None
 
 
 def test_a_file_with_no_patch_or_an_unread_diff_vetoes():
-    why = cp.tests_only_veto([{"filename": "tests/big.py", "status": "modified"}])
-    assert why.startswith("no readable patch for tests/big.py")
-    assert cp.tests_only_veto(None) == "could not read the diff to check test content"
-    assert cp.tests_only_veto([]) == "the diff lists no files"
+    why = cp.tests_only_veto([{"filename": "tests/test_big.py", "status": "added"}], EXISTING)
+    assert why.startswith("no readable patch for tests/test_big.py")
+    assert cp.tests_only_veto(None, EXISTING) == "could not read the diff to check test content"
+    assert cp.tests_only_veto([], EXISTING) == "the diff lists no files"
 
 
-def _tests_only_pr(monkeypatch, files):
-    monkeypatch.setattr(mg, "changed_paths", lambda *a: [f["filename"] for f in files])
-    monkeypatch.setattr(mg, "sh_strict", _gh(
-        [("pulls/9/files", json.dumps(files)),
-         (".auto_merge != null", "false\nh9\nmain\nbase0\n")]
-        + [(k.replace("pulls/7", "pulls/9"), v) for k, v in
-           _repo(["ci"], [_run("ci", "success")])]
-        + [("commits/h9/check-runs", json.dumps([_run("ci", "success")]))]))
-    monkeypatch.setattr(mg, "DRY_RUN", True)
-    pr = {"number": 9, "title": "test: cover parser", "body": "", "labels": [],
+# The read path: compare API at exactly base_sha...head_sha, head read once.
+
+def _tests_only(monkeypatch, files, head="hA", tree=None, paths=None):
+    reads = []
+    tree = tree if tree is not None else {"truncated": False,
+                                          "tree": [{"path": p} for p in EXISTING]}
+    answers = _gh([
+        (f"compare/base0...{head}", json.dumps({"files": files})),
+        ("git/trees/base0", json.dumps(tree)),
+        (".auto_merge != null", "false"),
+        ("pulls/9 --jq .head.sha", f"{head}\nmain\nfalse\nclean\nbase0\n"),
+        (".allow_auto_merge", "true"),
+        ("required_status_checks", '["ci"]'),
+        (f"commits/{head}/check-runs", json.dumps([_run("ci", "success")])),
+        ("commits/base0/check-runs", "[]"),
+        ("branches/main --jq .commit.sha", "base0")])
+    monkeypatch.setattr(mg, "sh_strict", lambda *a: reads.append(" ".join(a)) or answers(*a))
+    monkeypatch.setattr(mg, "changed_paths",
+                        lambda *a: paths if paths is not None else [f["filename"] for f in files])
+    pr = {"number": 9, "title": "test: cover p", "body": "", "labels": [],
           "author": {"login": "bot"}, "headRefName": "auto/tests-20261115"}
-    s = mg.Sweep()
-    mg._evaluate(pr, "o/r", 9, {}, s)
-    return s
+    return pr, reads
 
 
-def test_a_clean_tests_only_pr_still_merges(monkeypatch):
-    s = _tests_only_pr(monkeypatch, [_f("tests/test_p.py", "@@ -0,0 +1 @@\n+    assert p()\n")])
-    assert len(s.armed) == 1 and s.armed[0][2].startswith("tests-only; green")
-
-
-def test_a_tests_only_pr_that_skips_a_test_routes_to_review(monkeypatch):
-    s = _tests_only_pr(monkeypatch, [_f("tests/test_p.py", "@@ -1 +1,2 @@\n+@pytest.mark.skip\n")])
-    assert s.armed == []
-    [(_, _, why, _)] = s.review
-    assert why.startswith("tests-only rejected: adds a test-disabling marker")
-    assert _rows()[-1]["decision"] == "ROUTED"
-
-
-def test_a_diff_that_moved_between_reads_is_no_verdict(monkeypatch):
-    files = [_f("tests/test_p.py", "@@ -0,0 +1 @@\n+    assert p()\n")]
-    monkeypatch.setattr(mg, "sh_strict", _gh([("pulls/9/files", json.dumps(files)),
-                                              ("pulls/9 --jq .head.sha", "h9")]))
-    monkeypatch.setattr(mg, "changed_paths", lambda *a: ["tests/test_p.py", "tests/test_q.py"])
-    pr = {"number": 9, "title": "t", "body": "", "labels": []}
-    with pytest.raises(mg.ReadFailed):
-        mg._read(pr, "o/r", 9, {})
-
-
-def test_pr_files_reads_every_page(monkeypatch):
-    monkeypatch.setattr(mg, "sh_strict", lambda *a: (
-        json.dumps([_f("tests/a.py")]) + "\n" + json.dumps([_f("tests/b.py")])))
-    assert [f["filename"] for f in mg.pr_files("o/r", 9)] == ["tests/a.py", "tests/b.py"]
-
-
-def _heads(*shas):
-    """Successive answers to `pulls/9 --jq .head.sha` (the last repeats)."""
-    seq = list(shas)
-
-    def answer(_joined):
-        sha = seq.pop(0) if len(seq) > 1 else seq[0]
-        return f"{sha}\nmain\nfalse\nclean\nbase0\n"
-    return answer
-
-
-def _tests_only_reads(monkeypatch, heads, check_head):
-    files = [_f("tests/test_p.py", "@@ -0,0 +1 @@\n+    assert p()\n")]
-    monkeypatch.setattr(mg, "changed_paths", lambda *a: ["tests/test_p.py"])
-    monkeypatch.setattr(mg, "sh_strict", _gh(
-        [("pulls/9/files", json.dumps(files)),
-         (".auto_merge != null", "false"),
-         ("pulls/9 --jq .head.sha", heads),
-         (".allow_auto_merge", "true"),
-         ("required_status_checks", '["ci"]'),
-         (f"commits/{check_head}/check-runs", json.dumps([_run("ci", "success")])),
-         ("commits/base0/check-runs", "[]"),
-         ("branches/main --jq .commit.sha", "base0")]))
-    return {"number": 9, "title": "test: p", "body": "", "labels": [],
-            "author": {"login": "bot"}, "headRefName": "auto/t"}
-
-
-def test_a_head_that_moves_while_the_patch_is_read_is_no_verdict(monkeypatch):
-    pr = _tests_only_reads(monkeypatch, _heads("hA", "hB"), "hB")
-    with pytest.raises(mg.ReadFailed, match="head moved while its diff was read"):
-        mg._read(pr, "o/r", 9, {})
-
-
-def test_a_head_that_moves_after_the_patch_was_judged_is_no_verdict(monkeypatch):
-    # Patch judged at hA (both bracketing reads agree), then the State reads
-    # hB: the commit --match-head-commit would merge is not the one checked.
-    pr = _tests_only_reads(monkeypatch, _heads("hA", "hA", "hB"), "hB")
-    with pytest.raises(mg.ReadFailed, match="head moved after its diff was judged"):
-        mg._read(pr, "o/r", 9, {})
-
-
-def test_the_merge_is_pinned_to_the_head_whose_patch_was_judged(monkeypatch):
-    pr = _tests_only_reads(monkeypatch, _heads("hA"), "hA")
+def test_a_clean_new_test_file_merges_at_the_judged_sha(monkeypatch):
+    pr, reads = _tests_only(monkeypatch, [_new("tests/test_p.py")], head="hA")
     writes = []
     monkeypatch.setattr(mg, "DRY_RUN", False)
     monkeypatch.setattr(mg, "sh", lambda *a: writes.append(a) or (0, "", ""))
     s = mg.Sweep()
     mg._evaluate(pr, "o/r", 9, {}, s)
+    assert s.armed and s.armed[0][2].startswith("tests-only; green")
     merges = [w for w in writes if w[:2] == ("pr", "merge")]
     assert merges == [("pr", "merge", "9", "--repo", "o/r", "--squash",
                        "--match-head-commit", "hA")]
+    # The diff judged is the compare of exactly that range, and the head was
+    # read once -- there is no second head read to disagree with.
+    assert any("compare/base0...hA" in r for r in reads)
+    assert sum("pulls/9 --jq .head.sha" in r for r in reads) == 1
+    assert not any("pulls/9/files" in r for r in reads)
+
+
+def test_a_modified_test_file_is_never_auto_merged(monkeypatch):
+    pr, _ = _tests_only(monkeypatch, [_f("tests/test_q.py", "@@ -1 +1,2 @@\n+    assert q()\n")])
+    writes = []
+    monkeypatch.setattr(mg, "DRY_RUN", False)
+    monkeypatch.setattr(mg, "sh", lambda *a: writes.append(a) or (0, "", ""))
+    s = mg.Sweep()
+    mg._evaluate(pr, "o/r", 9, {}, s)
+    assert s.armed == [] and not [w for w in writes if w[:2] == ("pr", "merge")]
+    [(_, _, why, _)] = s.review
+    assert why == ("tests-only rejected: modified existing test file tests/test_q.py: "
+                   "only brand-new test files auto-merge")
+    assert _rows()[-1]["decision"] == "ROUTED"
+
+
+def test_an_aliased_skip_in_a_new_file_routes_to_review(monkeypatch):
+    patch = ("@@ -0,0 +1,4 @@\n+from pytest import mark as m\n+@m.skip\n"
+             "+def test_p():\n+    assert p()\n")
+    pr, _ = _tests_only(monkeypatch, [_new("tests/test_p.py", patch)])
+    s = mg.Sweep()
+    mg._evaluate(pr, "o/r", 9, {}, s)
+    assert s.armed == []
+    assert s.review[0][2].startswith("tests-only rejected: adds a test-disabling marker")
+
+
+def test_a_diff_that_is_not_the_classified_one_is_no_verdict(monkeypatch):
+    pr, _ = _tests_only(monkeypatch, [_new("tests/test_p.py"), _new("src/evil.py")],
+                        paths=["tests/test_p.py"])
+    with pytest.raises(mg.ReadFailed, match="not the diff that was classified"):
+        mg._read(pr, "o/r", 9, {})
+
+
+def test_a_truncated_base_tree_vetoes_rather_than_guesses(monkeypatch):
+    pr, _ = _tests_only(monkeypatch, [_new("tests/test_p.py")],
+                        tree={"truncated": True, "tree": []})
+    s = mg.Sweep()
+    mg._evaluate(pr, "o/r", 9, {}, s)
+    assert s.review[0][2].startswith("tests-only rejected: could not list the base tree")
+
+
+def test_a_compare_at_the_file_cap_is_not_an_answer(monkeypatch):
+    monkeypatch.setattr(mg, "sh_strict", lambda *a: json.dumps(
+        {"files": [_new(f"tests/test_{i}.py") for i in range(mg.COMPARE_FILE_CAP)]}))
+    with pytest.raises(mg.ReadFailed, match="possibly truncated"):
+        mg.compare_files("o/r", "base0", "hA")

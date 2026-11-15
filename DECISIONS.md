@@ -632,17 +632,20 @@ human lists the revert's sha in `merge_gate_ack_reverts`. A pause that
 cleared on its own would let the gate put the reverted change's sibling
 straight back.
 
-### 37. `tests-only` was a claim about paths.
+### 37. `tests-only` was a claim about paths, and no denylist fixes that.
 
 Deleting a failing test, adding `@pytest.mark.skip`, focusing a suite with
 `.only` and loosening `conftest.py` all touch only test files, and each makes
-the required check greener while proving less. The shape now also reads the
-patch, at one head: it is read between two reads of the head sha that must
-agree, and the head the merge is pinned to must be that same sha. Removals
-are not weighed. A first version netted removed assertions against added
-ones, which let an assertion move from a strong test to a weak one and net to
-zero; telling a harmless removal from a weakening one needs the test's
-meaning, so any removed line routes to a human. Renames and copies are vetoed
-for the same reason: whether a renamed file is still collected depends on
-each runner's globs. A tests-only PR that only adds still merges, which is
-what loops that write tests actually produce.
+the required check greener while proving less. The first fix read the patch
+and matched skip idioms; review kept finding more (an aliased mark,
+`raise SkipTest`, `__test__ = False`, a duplicate name that shadows a test, an
+early `return` in a modified test). A denylist of ways to weaken a test is
+never complete, so the rule is now structural: tests-only auto-merges only
+when every file is NEW, is a test path, is not harness or config, and shares
+no name with anything already in the repo. Any change to an existing test
+goes to a human. The marker scan stays, as a second line on the new files.
+
+The diff is read from the compare API for exactly `base_sha...head_sha`,
+where `head_sha` is the single head read the merge is pinned to with
+`--match-head-commit`. `pulls/{n}/files` describes whatever the head is
+when it answers; a commit range cannot move under the reader.

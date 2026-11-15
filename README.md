@@ -42,7 +42,7 @@ below get a veto.)
 |---|---|---|
 | `lockfile-only` | only regenerated lockfiles changed **and** every version delta inside is patch/minor | a major hiding in `uv.lock` |
 | `dependency-bump` | manifest + lockfile, every delta patch/minor (read from the PR body — the title of a group bump names no versions) | any group containing a major, a `0.x` minor, or a SHA-only bump |
-| `tests-only` | every path is a test file **and the patch does not weaken the tests** | one source file alongside forty tests — there is no partial credit; a deleted, renamed or copied test file, an added skip/xfail/`.only`/`pytestmark` marker, a touched `conftest.py` or e2e/Playwright/Cypress harness, or **any removed line** — a tests-only PR merges only if it purely adds |
+| `tests-only` | every file is a **brand-new** test file (status `added` in the compare of exactly the judged base...head), none is harness/config, none shares a name with an existing path, and none contains a skip/xfail/`.only`/`pytestmark`/`SkipTest`/`__test__` marker or a duplicate test name | one source file alongside forty tests — there is no partial credit; **any change to an existing test file** (modified, removed, renamed, copied) routes to a human |
 | `data-artifact-only` | every path is inside a directory the repo has explicitly opted in via `data_dir` | anything, if the repo never opted in |
 | `ci-fix` | every added line matches an explicitly reviewed whitelist of action bumps | a workflow edit that merely *reads* like a fix |
 | `content` / `mixed` / `empty` / `unreadable` | — | always routed to a human |

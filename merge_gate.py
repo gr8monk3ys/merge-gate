@@ -4,7 +4,7 @@
 Four conditions, ALL required, no overrides:
 
   1. diff shape is on the allowlist and carries no content veto (and a
-     tests-only diff does not weaken the tests)
+     tests-only diff only ADDS new test files, judged at the merged head)
   2. the repo has >= 1 required status check on the base branch, and at
      least one of them is a correctness gate (else: DRIFT)
   3. every required check is currently green -- newest run per name,
@@ -672,9 +672,6 @@ class Reading:
         self.head_sha: str | None = None   # head when the arm was read
         self.base_ref: str | None = None
         self.base_sha: str | None = None
-        # The head whose patch was content-checked (tests-only). When set,
-        # it is the only head this PR may be merged at.
-        self.content_sha: str | None = None
 
 
 def _read(pr, repo, num, data_dirs, cache=None, stop=None):
@@ -710,31 +707,6 @@ def _read(pr, repo, num, data_dirs, cache=None, stop=None):
             kind = bump_kind(title, body)
             r.why = f"shape={r.shape}" + (f"; bump={kind}" if kind else "")
 
-    # A tests-only shape is a claim about paths; whether the diff weakens the
-    # tests is a claim about content, so read the patch. Only for this shape:
-    # it is the one whose risk lives in the lines rather than the files.
-    if r.mergeable and r.shape == "tests-only":
-        # The patch must be the patch of the commit that gets merged. Head
-        # read before AND after the files read: equal means the files
-        # describe that commit. It is then pinned as `content_sha`, and the
-        # State's judged head -- the sha --match-head-commit merges -- must
-        # equal it, or nothing is decided this sweep.
-        bail_if(stop)
-        before = pr_head_sha(repo, num)
-        files = pr_files(repo, num)
-        after = pr_head_sha(repo, num)
-        if before != after:
-            raise ReadFailed(f"{repo}#{num}: head moved while its diff was read "
-                             f"({before[:8]} -> {after[:8]})")
-        r.content_sha = before
-        if sorted(f.get("filename") or "" for f in files) != sorted(paths):
-            # The PR moved between the two reads; judge it next sweep, whole.
-            raise ReadFailed(f"{repo}#{num}: diff changed between reads")
-        veto = tests_only_veto(files)
-        if veto:
-            r.mergeable = False
-            r.why = f"tests-only rejected: {veto}"
-
     # Is there a standing arm? Read for every shape: an arm outside the
     # allowlist is drift to correct, and an arm on an allowlisted PR is a
     # standing permission to retire (see _decide).
@@ -750,9 +722,31 @@ def _read(pr, repo, num, data_dirs, cache=None, stop=None):
 
     if r.mergeable:
         r.state = read_state(repo, num, cache, stop)
-        if r.content_sha and r.state.sha != r.content_sha:
-            raise ReadFailed(f"{repo}#{num}: head moved after its diff was judged "
-                             f"({r.content_sha[:8]} -> {r.state.sha[:8]})")
+
+    # tests-only is a claim about paths. What the diff does to the tests is a
+    # claim about content, and no denylist of skip idioms is complete
+    # (aliased marks, SkipTest, `__test__ = False`, a shadowing duplicate
+    # name, an early return), so the rule is structural: only brand-new test
+    # files merge. It is judged from the compare API for exactly
+    # base_sha...head_sha, where head_sha is read_state's ONE read of the
+    # head -- the same sha --match-head-commit merges. Nothing re-reads it.
+    if r.mergeable and r.shape == "tests-only":
+        st = r.state
+        bail_if(stop)
+        files = compare_files(repo, st.base_sha, st.sha)
+        names = sorted(f.get("filename") or "" for f in files)
+        if names != sorted(paths):
+            # The PR moved between the path read and the head read. Judge it
+            # next sweep, whole, rather than on half of each.
+            raise ReadFailed(f"{repo}#{num}: diff at {st.sha[:8]} is not the "
+                             "diff that was classified")
+        bail_if(stop)
+        existing = cache.get(("tree", repo, st.base_sha),
+                             lambda: base_tree_paths(repo, st.base_sha))
+        veto = tests_only_veto(files, existing)
+        if veto:
+            r.mergeable = False
+            r.why = f"tests-only rejected: {veto}"
     return r
 
 
@@ -904,32 +898,48 @@ def detect_reverts(rows, now=None, read=branch_commits):
     return found, unscanned
 
 
-def pr_head_sha(repo, num):
-    """The PR's current head sha. Raises ReadFailed."""
-    out = sh_strict("api", f"repos/{repo}/pulls/{num}", "--jq", ".head.sha")
-    sha = (out or "").strip().splitlines()[:1]
-    if not sha or not sha[0]:
-        raise ReadFailed(f"{repo}#{num}: no head sha")
-    return sha[0].strip()
+# GitHub's compare endpoint lists at most this many files. A list that long
+# may be cut short, and a short list could hide the file that matters.
+COMPARE_FILE_CAP = 300
 
 
-def pr_files(repo, num):
-    """pulls/{n}/files, every page: filename, status, patch. Raises
-    ReadFailed -- an unread patch is not a clean one."""
-    out = sh_strict("api", f"repos/{repo}/pulls/{num}/files?per_page=100",
-                    "--paginate")
+def compare_files(repo, base_sha, head_sha):
+    """Changed files (filename, status, patch, previous_filename) between two
+    exact commits, from `compare/{base}...{head}`. Raises ReadFailed.
+
+    Both ends are shas, not refs: the answer describes one commit range and
+    cannot move under the caller the way pulls/{n}/files can.
+    """
+    out = sh_strict("api", f"repos/{repo}/compare/{base_sha}...{head_sha}")
     if out is None:
-        raise ReadFailed(f"{repo}#{num}: pull request files not found")
+        raise ReadFailed(f"{repo}: compare {base_sha[:8]}...{head_sha[:8]} not found")
     try:
-        pages = _parse_pages(out)
+        doc = json.loads(out)
     except json.JSONDecodeError:
-        raise ReadFailed(f"{repo}#{num}: unparseable pull request files")
-    files = []
-    for page in pages:
-        if not isinstance(page, list):
-            raise ReadFailed(f"{repo}#{num}: unexpected files shape")
-        files.extend(f for f in page if isinstance(f, dict))
-    return files
+        raise ReadFailed(f"{repo}: unparseable compare {base_sha[:8]}...{head_sha[:8]}")
+    files = doc.get("files") if isinstance(doc, dict) else None
+    if not isinstance(files, list):
+        raise ReadFailed(f"{repo}: compare {base_sha[:8]}...{head_sha[:8]} has no files")
+    if len(files) >= COMPARE_FILE_CAP:
+        raise ReadFailed(f"{repo}: compare lists {len(files)} files, possibly truncated")
+    return [f for f in files if isinstance(f, dict)]
+
+
+def base_tree_paths(repo, sha):
+    """Every path in the tree at `sha`, or None when GitHub truncated the
+    listing -- None is "could not check for a name collision", and
+    tests_only_veto refuses on it. Raises ReadFailed when unread."""
+    out = sh_strict("api", f"repos/{repo}/git/trees/{sha}?recursive=1")
+    if out is None:
+        raise ReadFailed(f"{repo}: tree {sha[:8]} not found")
+    try:
+        doc = json.loads(out)
+    except json.JSONDecodeError:
+        raise ReadFailed(f"{repo}: unparseable tree {sha[:8]}")
+    if not isinstance(doc, dict) or doc.get("truncated"):
+        return None
+    return [e.get("path") for e in doc.get("tree") or []
+            if isinstance(e, dict) and e.get("path")]
 
 
 def pr_source(pr):

@@ -505,102 +505,130 @@ def ci_fix_allowed(diff_text):
 
 
 # ---------------------------------------------------------------------------
-# tests-only is judged on content, not just paths.
+# tests-only merges brand-new test files, and nothing else.
 #
 # Every path being a test file says nothing about what the diff does to the
 # tests. Deleting a failing test, marking it skipped, focusing a suite with
-# `.only` so the rest never run, or loosening conftest.py all classify as
-# `tests-only` on paths alone -- and each one makes the required check
-# greener while proving less. These rules run on the PR's patch.
+# `.only`, an early `return` in a test body, a duplicate name that shadows a
+# test, `__test__ = False`, an aliased mark -- each makes the required check
+# greener while proving less, and a denylist of idioms can never be complete.
+# So the rule is structural: a tests-only PR auto-merges only when every file
+# is NEW (status `added`), is a test path, is not test harness or config, and
+# does not share a name with anything already in the repo. Any change to an
+# existing test routes to a human. The marker scan below is a second line of
+# defence on the new files, not the rule.
 # ---------------------------------------------------------------------------
 
 # Added lines matching any of these switch a test off (or switch every other
-# test off). Named, so the reason says which rule fired.
+# test off). Named, so the reason says which rule fired. Deliberately broad:
+# a false positive costs a review, a false negative costs a test.
 TEST_DISABLERS = [
-    # With or without the `@`, and with or without the `pytest.` prefix
-    # (`from pytest import mark`): `mark.skip` is the marker either way.
-    ("pytest mark.skip/skipif/xfail", r"\bmark\.(skip|skipif|xfail)\b"),
-    # A module-level `pytestmark = ...` applies a marker to every test in
-    # the file without a decorator anywhere.
-    ("pytestmark =", r"\bpytestmark\s*="),
-    ("pytest.skip(/xfail(/importorskip(", r"\bpytest\.(skip|xfail|importorskip)\s*\("),
+    # Any `.skip` / `.xfail` / `.only` / `.todo` attribute, called or not:
+    # pytest.mark.skip, mark.skip, an aliased `m.skip`, it.skip, describe.only.
+    (".skip/.xfail/.only/.todo attribute", r"\.(skip|skipif|xfail|only|todo)\b"),
+    ("pytestmark", r"\bpytestmark\b"),
+    ("__test__ =", r"\b__test__\s*="),
+    ("SkipTest", r"\bSkipTest\b"),
     ("xfail", r"\bxfail\b"),
-    ("unittest skip", r"\bunittest\.(skip|skipIf|skipUnless|expectedFailure)\b"
-                      r"|@(skip|skipIf|skipUnless|expectedFailure)\b"
-                      r"|\bself\.skipTest\s*\("),
-    ("it/describe/test.skip/.only/.todo",
-     r"\b(it|describe|test|context|suite)\.(skip|only|todo)\b"),
-    (".only(", r"\.only\s*\("),
-    (".skip(", r"\.skip\s*\("),
+    ("pytest.skip/importorskip", r"\bpytest\.(skip|importorskip)\b"),
+    ("unittest skip decorator", r"@(skip|skipIf|skipUnless|expectedFailure)\b"
+                                r"|\bunittest\.(skip|skipIf|skipUnless|expectedFailure)\b"
+                                r"|\bskipTest\b"),
+    ("import of a skip helper", r"\bimport\b.*\b(skip|skipif|skipIf|skipUnless|"
+                                r"expectedFailure|xfail|SkipTest|mark)\b"),
     ("xit/xdescribe/fit/fdescribe", r"\b(x|f)(it|describe|test)\s*\("),
     ("t.Skip(", r"\bt\.Skip(Now|f)?\s*\("),
     ("#[ignore]", r"#\[ignore\]"),
 ]
 
-# Used only to make a removal's reason specific. Removals are not netted
-# against additions: any removed line is a veto (see tests_only_veto).
-ASSERTION = re.compile(r"\bassert|\bexpect\s*\(|\.should\b|\bshould\.|"
-                       r"\btoBe\w*\b|\btoEqual\b|\btoMatch\w*\b|\btoThrow\b")
-
-# What a test RUN is configured by. Touching any of it changes what runs, not
+# What a test RUN is configured by. A new file here changes what runs, not
 # just what is tested: conftest.py fixtures apply to every test below them.
 _HARNESS_DIRS = {"e2e", "playwright", "cypress"}
-_HARNESS_FILES = [r"^conftest\.py$", r"^playwright\.config\.\w+$",
-                  r"^cypress\.config\.\w+$", r"^cypress\.json$"]
+_HARNESS_FILES = [
+    r"^conftest\.py$", r"^pytest\.ini$", r"^tox\.ini$", r"^setup\.cfg$",
+    r"^pyproject\.toml$", r"^\.coveragerc$",
+    r"^playwright\.config\.\w+$", r"^cypress\.config\.\w+$", r"^cypress\.json$",
+    r"^jest\.config\.\w+$", r"^jest\.setup\.\w+$", r"^vitest\.config\.\w+$",
+    r"^vitest\.workspace\.\w+$", r"^vitest\.setup\.\w+$", r"^setupTests\.\w+$",
+    r"^karma\.conf\.\w+$", r"^\.mocharc(\.\w+)?$",
+]
+
+_RE_PY_TEST_DEF = re.compile(r"^\s*(?:async\s+)?def\s+(test\w*)\s*\(")
 
 
 def is_test_harness(path):
-    """conftest.py, or anything in / configuring e2e, Playwright or Cypress."""
+    """conftest.py, test-runner config, or anything in e2e/Playwright/Cypress."""
     parts = (path or "").split("/")
     base = parts[-1]
     return (any(re.match(p, base) for p in _HARNESS_FILES)
             or any(seg in _HARNESS_DIRS for seg in parts[:-1]))
 
 
-def tests_only_veto(files):
+def tests_only_veto(files, existing_paths=()):
     """Why a `tests-only` diff must not auto-merge, or None.
 
-    `files` is the pulls/{n}/files payload: dicts with filename, status,
-    patch and (for renames) previous_filename. None -- the diff could not be
-    read -- vetoes, like everywhere else. Reasons are specific: they name the
-    file, the rule and, for a marker, the line.
+    `files` is the compare API's file list for the exact commit range being
+    merged: dicts with filename, status, patch and (for renames)
+    previous_filename. `existing_paths` is every path in the base tree; None
+    means it could not be listed. Either being None vetoes: "I could not
+    check" never resolves to "there is nothing there". Reasons name the
+    file and the rule.
     """
     if files is None:
         return "could not read the diff to check test content"
     if not files:
         return "the diff lists no files"
+    if existing_paths is None:
+        return "could not list the base tree to check new test names for collisions"
+
+    def key(p):
+        return p.rsplit("/", 1)[-1].lower()
+    existing = {}
+    for p in existing_paths:
+        existing.setdefault(key(p), p)
+    new_names = {}
+
     for f in files:
         name = f.get("filename") or ""
         status = f.get("status") or ""
         for p in (name, f.get("previous_filename")):
             if p and is_test_harness(p):
                 return f"touches test harness/config: {p}"
-        if status == "removed":
-            return f"deletes test file {name}"
-        # A rename can drop a file out of collection (test_x.py -> x.py,
-        # a.test.ts -> a.ts) and a copy can shadow one; either is a deletion
-        # in effect. Deny every one rather than model each runner's globs.
-        if status in ("renamed", "copied"):
-            return (f"{status} test file {f.get('previous_filename') or '?'} "
-                    f"-> {name}")
+        if status != "added":
+            was = f.get("previous_filename")
+            return (f"{status or 'changed'} existing test file "
+                    f"{(was + ' -> ') if was else ''}{name}: only brand-new test "
+                    "files auto-merge")
+        if not is_test(name):
+            return f"{name} is not a test path"
+        # A new test module named like an existing file can shadow it (pytest
+        # rootdir-less imports, jest haste maps), and two new ones can shadow
+        # each other.
+        clash = existing.get(key(name)) or new_names.get(key(name))
+        if clash:
+            return f"new test file {name} shares its name with {clash}"
+        new_names[key(name)] = name
         patch = f.get("patch")
         if patch is None:
             return f"no readable patch for {name} (binary or too large to judge)"
+        defs = {}
         for line in patch.splitlines():
-            if line.startswith("+"):
-                body = line[1:]
-                for label, pat in TEST_DISABLERS:
-                    if re.search(pat, body):
-                        return (f"adds a test-disabling marker ({label}) in {name}: "
-                                f"{body.strip()[:80]}")
-            elif line.startswith("-") and line[1:].strip():
-                # Deny by default. Telling a harmless removal from a
-                # weakening one needs the test's meaning: an edited expected
-                # value, a dropped setup step and a deleted assertion all
-                # look alike here. A tests-only PR that only ADDS merges.
-                gone = line[1:].strip()[:80]
-                kind = "an assertion" if ASSERTION.search(line[1:]) else "a line"
-                return f"removes {kind} from existing test code in {name}: {gone}"
+            if line.startswith("-") and line[1:].strip():
+                # An `added` file has no removals; one that does is not new.
+                return f"{name} is listed as added but its patch removes lines"
+            if not line.startswith("+"):
+                continue
+            body = line[1:]
+            for label, pat in TEST_DISABLERS:
+                if re.search(pat, body):
+                    return (f"adds a test-disabling marker ({label}) in {name}: "
+                            f"{body.strip()[:80]}")
+            m = _RE_PY_TEST_DEF.match(body)
+            if m:
+                if m.group(1) in defs:
+                    return (f"defines {m.group(1)} twice in {name}; the second "
+                            "shadows the first")
+                defs[m.group(1)] = True
     return None
 
 

@@ -23,12 +23,16 @@ Releases before 0.9.0 are described by their commit and PR messages;
   per repo `merge_gate_max_per_day`) real gate merges in the last 24h, or when
   a correctness check on the base head is red.
 - `detect_reverts()`, run at the start of every sweep.
-- `tests-only` content check, judged at one pinned head (read before and
-  after the patch; the merged head must equal it): a deleted, renamed or
-  copied test file, an added skip/xfail/`.only`/`pytestmark` marker, a touched
-  `conftest.py` / e2e / Playwright / Cypress harness, any removed non-blank
-  line (deny by default), or an unreadable patch routes the PR to review. A
-  tests-only PR that only adds lines can merge.
+- `tests-only` now auto-merges **only brand-new test files**, judged from the
+  compare API for exactly `base_sha...head_sha` (the head read once, the same
+  sha passed to `--match-head-commit`). Any modified, removed, renamed or
+  copied test file, any test harness/config file (conftest.py, pytest.ini,
+  tox.ini, setup.cfg, pyproject.toml, jest/vitest/karma/mocha config,
+  Playwright/Cypress config or e2e/playwright/cypress dirs), a new name that
+  collides with an existing path, a duplicate test name, an unreadable patch
+  or base tree, or a disabling marker in a new file (skip/xfail/.only/.todo
+  attributes, `pytestmark`, `SkipTest`, `__test__ =`, aliased mark imports,
+  xit/fit, `t.Skip`, `#[ignore]`) routes the PR to review.
 - `repos.yml` fields: `may_skip`, `correctness_checks`,
   `merge_gate_max_per_day`, `merge_gate_paused`, `merge_gate_ack_reverts`.
 - `sweep(record=False)` for read-only consumers.
