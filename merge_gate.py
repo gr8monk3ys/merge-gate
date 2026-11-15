@@ -730,6 +730,15 @@ def _read(pr, repo, num, data_dirs, cache=None, stop=None):
     # files merge. It is judged from the compare API for exactly
     # base_sha...head_sha, where head_sha is read_state's ONE read of the
     # head -- the same sha --match-head-commit merges. Nothing re-reads it.
+    # A token scan of new files can never prove they don't stop the run early
+    # (os._exit at import makes the runner report success having run
+    # nothing). Until the repo's CI reports how many tests ran, so a drop is
+    # visible, tests-only stays a human call: a repo opts in explicitly.
+    if (r.mergeable and r.shape == "tests-only"
+            and cache.config(repo).get("allow_tests_only") is not True):
+        r.mergeable = False
+        r.why = ("tests-only auto-merge is off for this repo: set allow_tests_only "
+                 "in repos.yml once its CI reports test counts")
     if r.mergeable and r.shape == "tests-only":
         st = r.state
         bail_if(stop)
