@@ -165,7 +165,8 @@ def test_gate_config_is_read_from_repos_yml(tmp_path, monkeypatch):
     # Absent is the strict value, never a permissive one.
     assert cfg["c"] == {"may_skip": [], "correctness_checks": [],
                         "merge_gate_max_per_day": None,
-                        "merge_gate_paused": False, "merge_gate_ack_reverts": []}
+                        "merge_gate_paused": False, "merge_gate_ack_reverts": [],
+                        "allow_tests_only": False}
 
 
 def test_a_missing_repos_yml_yields_no_gate_config(tmp_path, monkeypatch):
@@ -790,6 +791,11 @@ def test_a_file_with_no_patch_or_an_unread_diff_vetoes():
 
 # The read path: compare API at exactly base_sha...head_sha, head read once.
 
+def OPT_IN():
+    """A sweep cache for a repo that opted in to tests-only auto-merge."""
+    return mg.RepoCache({"r": {"allow_tests_only": True}})
+
+
 def _tests_only(monkeypatch, files, head="hA", tree=None, paths=None):
     reads = []
     tree = tree if tree is not None else {"truncated": False,
@@ -818,7 +824,7 @@ def test_a_clean_new_test_file_merges_at_the_judged_sha(monkeypatch):
     monkeypatch.setattr(mg, "DRY_RUN", False)
     monkeypatch.setattr(mg, "sh", lambda *a: writes.append(a) or (0, "", ""))
     s = mg.Sweep()
-    mg._evaluate(pr, "o/r", 9, {}, s)
+    mg._evaluate(pr, "o/r", 9, {}, s, OPT_IN())
     assert s.armed and s.armed[0][2].startswith("tests-only; green")
     merges = [w for w in writes if w[:2] == ("pr", "merge")]
     assert merges == [("pr", "merge", "9", "--repo", "o/r", "--squash",
@@ -836,7 +842,7 @@ def test_a_modified_test_file_is_never_auto_merged(monkeypatch):
     monkeypatch.setattr(mg, "DRY_RUN", False)
     monkeypatch.setattr(mg, "sh", lambda *a: writes.append(a) or (0, "", ""))
     s = mg.Sweep()
-    mg._evaluate(pr, "o/r", 9, {}, s)
+    mg._evaluate(pr, "o/r", 9, {}, s, OPT_IN())
     assert s.armed == [] and not [w for w in writes if w[:2] == ("pr", "merge")]
     [(_, _, why, _)] = s.review
     assert why == ("tests-only rejected: modified existing test file tests/test_q.py: "
@@ -849,7 +855,7 @@ def test_an_aliased_skip_in_a_new_file_routes_to_review(monkeypatch):
              "+def test_p():\n+    assert p()\n")
     pr, _ = _tests_only(monkeypatch, [_new("tests/test_p.py", patch)])
     s = mg.Sweep()
-    mg._evaluate(pr, "o/r", 9, {}, s)
+    mg._evaluate(pr, "o/r", 9, {}, s, OPT_IN())
     assert s.armed == []
     assert s.review[0][2].startswith("tests-only rejected: adds a test-disabling marker")
 
@@ -858,14 +864,14 @@ def test_a_diff_that_is_not_the_classified_one_is_no_verdict(monkeypatch):
     pr, _ = _tests_only(monkeypatch, [_new("tests/test_p.py"), _new("src/evil.py")],
                         paths=["tests/test_p.py"])
     with pytest.raises(mg.ReadFailed, match="not the diff that was classified"):
-        mg._read(pr, "o/r", 9, {})
+        mg._read(pr, "o/r", 9, {}, OPT_IN())
 
 
 def test_a_truncated_base_tree_vetoes_rather_than_guesses(monkeypatch):
     pr, _ = _tests_only(monkeypatch, [_new("tests/test_p.py")],
                         tree={"truncated": True, "tree": []})
     s = mg.Sweep()
-    mg._evaluate(pr, "o/r", 9, {}, s)
+    mg._evaluate(pr, "o/r", 9, {}, s, OPT_IN())
     assert s.review[0][2].startswith("tests-only rejected: could not list the base tree")
 
 
@@ -905,3 +911,14 @@ def test_an_early_exit_or_runtime_patch_in_a_new_test_is_vetoed(line):
 ])
 def test_ordinary_new_test_modules_still_pass(path):
     assert cp.tests_only_veto([_new(path)], EXISTING) is None
+
+
+def test_tests_only_is_off_unless_the_repo_opts_in(monkeypatch):
+    pr, reads = _tests_only(monkeypatch, [_new("tests/test_p.py")], head="hA")
+    writes = []
+    monkeypatch.setattr(mg, "DRY_RUN", False)
+    monkeypatch.setattr(mg, "sh", lambda *a: writes.append(a) or (0, "", ""))
+    s = mg.Sweep()
+    mg._evaluate(pr, "o/r", 9, {}, s)
+    assert s.armed == [] and not [w for w in writes if w[:2] == ("pr", "merge")]
+    assert s.review[0][2].startswith("tests-only auto-merge is off for this repo")

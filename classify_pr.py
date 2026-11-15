@@ -741,6 +741,8 @@ def parse_repos_yml(path=None):
             "merge_gate_paused": bool(body.get("merge_gate_paused", False)),
             "merge_gate_ack_reverts": [str(s) for s in
                                        body.get("merge_gate_ack_reverts") or []],
+            # Only a literal `true` opts in; anything else is the strict default.
+            "allow_tests_only": body.get("allow_tests_only") is True,
         }
     return out
 
@@ -760,7 +762,8 @@ def load_data_dirs():
 
 
 GATE_CONFIG_FIELDS = ("may_skip", "correctness_checks", "merge_gate_max_per_day",
-                      "merge_gate_paused", "merge_gate_ack_reverts")
+                      "merge_gate_paused", "merge_gate_ack_reverts",
+                      "allow_tests_only")
 
 
 def load_gate_config():
@@ -775,6 +778,9 @@ def load_gate_config():
                               reads.
       merge_gate_max_per_day  overrides MERGE_GATE_MAX_PER_DAY for this repo.
       merge_gate_paused       true: hold every gate merge in this repo.
+      allow_tests_only        true: tests-only PRs may auto-merge (still only
+                              brand-new test modules). Absent: they route to
+                              review. Set it once CI reports test counts.
       merge_gate_ack_reverts  revert commit SHAs a human has looked at. A
                               pause raised by a detected revert clears only
                               when its SHA is listed here.

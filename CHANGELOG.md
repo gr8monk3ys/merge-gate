@@ -3,6 +3,16 @@
 Releases before 0.9.0 are described by their commit and PR messages;
 `DECISIONS.md` tells why each rule exists.
 
+## 0.9.2 — tests-only is opt-in
+
+### Changed
+
+- **tests-only PRs route to review unless the repo sets `allow_tests_only:
+  true`** in repos.yml. No scan of a new file's text can prove it doesn't stop
+  the run early (`os._exit` reached through `__import__`, `importlib`,
+  `setattr`, ...), so this waits for CI-reported test counts that make a drop
+  visible. Opted-in repos keep the 0.9.1 rules.
+
 ## 0.9.1 — tests-only allowlist
 
 ### Fixed
