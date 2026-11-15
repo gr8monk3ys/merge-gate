@@ -3,6 +3,21 @@
 Releases before 0.9.0 are described by their commit and PR messages;
 `DECISIONS.md` tells why each rule exists.
 
+## 0.9.1 — tests-only allowlist
+
+### Fixed
+
+- **A new file in a tests-only PR must be a test module** (`test_*.py`,
+  `*_test.py`, `*.test.*`, `*.spec.*`). Helpers, `__init__.py`, fixture data,
+  configs and dotfiles change what runs without being tests, so they route to
+  review.
+- **More harness files**: `.pytest.ini`, `pytest.toml`, `package.json`,
+  `tsconfig*.json`, Babel config and `.env*` count as test-run config.
+- **Early exits are vetoed**: `os._exit`, `sys.exit`, `pytest.exit`,
+  `process.exit`, bare `exit()`/`quit()`, Go `TestMain`, and patching
+  `sys.modules` or builtins. `os._exit(0)` at import made pytest report
+  success having run nothing.
+
 ## 0.9.0 — trust hardening
 
 ### Added

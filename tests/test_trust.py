@@ -874,3 +874,34 @@ def test_a_compare_at_the_file_cap_is_not_an_answer(monkeypatch):
         {"files": [_new(f"tests/test_{i}.py") for i in range(mg.COMPARE_FILE_CAP)]}))
     with pytest.raises(mg.ReadFailed, match="possibly truncated"):
         mg.compare_files("o/r", "base0", "hA")
+
+
+# --- v0.9.1: only test modules, no early exits, more harness files ----------
+
+@pytest.mark.parametrize("path", [
+    "tests/helpers.py", "tests/__init__.py", "tests/fixtures/data.json",
+    "tests/.pytest.ini", "tests/pytest.toml", "tests/package.json",
+    "tests/.babelrc", "tests/tsconfig.test.json", "tests/.env",
+])
+def test_a_new_file_that_is_not_a_test_module_is_vetoed(path):
+    why = cp.tests_only_veto([_new(path)], EXISTING)
+    assert why is not None and path in why
+
+
+@pytest.mark.parametrize("line", [
+    "import os; os._exit(0)", "sys.exit(0)", "pytest.exit('done')",
+    "process.exit(0)", "exit()", "quit()", "func TestMain(m *testing.M) {",
+    "sys.modules['app'] = fake", "builtins.open = fake",
+])
+def test_an_early_exit_or_runtime_patch_in_a_new_test_is_vetoed(line):
+    patch = "@@ -0,0 +1,2 @@\n+" + line + "\n+def test_p():\n"
+    why = cp.tests_only_veto([_new("tests/test_p.py", patch)], EXISTING)
+    assert why is not None and "tests/test_p.py" in why
+
+
+@pytest.mark.parametrize("path", [
+    "tests/test_new.py", "tests/new_test.py", "src/new.test.ts",
+    "web/a.spec.tsx",
+])
+def test_ordinary_new_test_modules_still_pass(path):
+    assert cp.tests_only_veto([_new(path)], EXISTING) is None
