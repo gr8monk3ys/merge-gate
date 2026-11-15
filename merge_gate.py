@@ -48,8 +48,8 @@ import gate_ledger as ledger  # noqa: E402
 from classify_pr import (  # noqa: E402
     DEFAULT_WORKERS, Abandoned, _run_gh, auto_mergeable, bail_if, bump_kind,
     changed_paths, classify, conflict_self_heals, content_veto,
-    enumerate_open_prs, is_conflict, is_dependabot, load_data_dirs,
-    load_gate_config, promote_candidate, repo_visibility,
+    enumerate_open_prs, is_conflict, is_correctness_check, is_dependabot,
+    load_data_dirs, load_gate_config, promote_candidate, repo_visibility,
 )
 
 DRY_RUN = os.environ.get("DRY_RUN", "1") != "0"
@@ -76,6 +76,11 @@ CONFLICTING = "CONFLICTING with base"
 # Same contract: a prefix _evaluate matches on to decide who gets the rebase
 # kick. Reworded here, silently nobody is asked to rebase.
 STALE_BASE = "STALE BASE"
+# Same contract again: the prefix _decide files under `drift` rather than
+# `skipped`. A repo that permits auto-merge but has no correctness gate is
+# not "deliberately ungated" -- it is a Phase 1 setting that no longer
+# matches the repo, and it needs a person to fix the setting or the gate.
+DRIFT = "DRIFT"
 REBASE_NAG_HOURS = 24  # at most one @dependabot rebase request per PR per day
 
 
@@ -349,6 +354,12 @@ class State:
         self.checks: list = []                    # [{name, conclusion, app}] per required
         self.branch_head: str | None = None       # where base was when read
 
+    @property
+    def correctness(self):
+        """The required checks that are gates on the code still working."""
+        return [c for c in self.required or []
+                if is_correctness_check(c, self.declared)]
+
 
 def grade_checks(st, latest):
     """Sort each required check into exactly one bucket on `st`.
@@ -422,7 +433,7 @@ def read_state(repo, number, cache=None, stop=None, cfg=None):
     bail_if(stop)
     st.required = cache.get(("required_checks", repo, base),
                             lambda: required_checks(repo, base))
-    if not st.required:
+    if not st.required or not st.correctness:
         return st
 
     # An armed PR that goes CONFLICTING sits forever: auto-merge can never
@@ -462,8 +473,18 @@ def judge(st, moved=frozenset()):
         return None, "DRAFT — cannot merge until marked ready"
     if not st.allow_auto:
         return None, "repo has auto-merge disabled (no real test gate)"
+    # allow_auto_merge is Phase 1's assertion that a real test gate exists.
+    # When the required checks do not bear that out, the assertion has
+    # drifted: fraud-stream's lone required `security-baseline` is green on
+    # code that does not build. Not a merge, and not "deliberately ungated".
     if not st.required:
-        return None, f"no required checks on {st.base}"
+        return None, (f"{DRIFT} — allow_auto_merge is on but {st.base} has "
+                      "no required checks")
+    if not st.correctness:
+        return None, (f"{DRIFT} — allow_auto_merge is on but no required check "
+                      f"on {st.base} is a correctness gate "
+                      f"(required: {', '.join(st.required)}; declare real gates "
+                      "in repos.yml correctness_checks)")
     if st.conflict:
         return False, CONFLICTING
     if st.missing:
@@ -540,9 +561,15 @@ class Sweep:
     describing the sweep that put finance-owl's main in the red.
     """
 
-    def __init__(self):
+    def __init__(self, record=True):
         self.armed, self.review, self.skipped = [], [], []
         self.stale, self.failed = [], []
+        self.drift = []      # auto-merge on, no correctness gate: see DRIFT
+        # Whether verdicts are appended to the merge ledger. sweep(record=False)
+        # lets a read-only consumer (a dashboard) ask without writing.
+        self.record = record
+        self.run_id = (dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+                       + f"-{os.getpid()}")
         self.moved = set()   # {(repo, base_ref)}
         # Set when a Budget stopped the walk early. `unreached` is what was
         # left, so a caller can say how much of the queue it never looked at
@@ -563,7 +590,8 @@ class Sweep:
     def verdicts(self):
         """Rows that state a decision. `failed` is not one: it says GitHub
         did not answer, which is the absence of a verdict, not a verdict."""
-        return len(self.armed) + len(self.stale) + len(self.review) + len(self.skipped)
+        return (len(self.armed) + len(self.stale) + len(self.review)
+                + len(self.skipped) + len(self.drift))
 
 
 class Reading:
@@ -685,8 +713,10 @@ def ledger_row(r, decision, reason, merge_commit_sha=None):
 def _record(s, row):
     """Append a row; a failure is kept on the Sweep and reported, never
     swallowed. The verdict itself has already been reached and stands."""
+    if not s.record:
+        return
     try:
-        ledger.append(row)
+        ledger.append({**row, "run": s.run_id})
     except ledger.LedgerError as exc:
         s.ledger_errors.append(str(exc))
 
@@ -749,7 +779,10 @@ def _decide(r, s):
     sha, base = st.sha, st.base
 
     if green is None:
-        _file(s, "skipped", r, detail, ledger.SKIPPED)
+        if detail.startswith(DRIFT):
+            _file(s, "drift", r, detail, ledger.DRIFT)
+        else:
+            _file(s, "skipped", r, detail, ledger.SKIPPED)
         return
 
     if green and not DRY_RUN:
@@ -813,7 +846,7 @@ def _evaluate(pr, repo, num, data_dirs, s, cache=None):
     _decide(_read(pr, repo, num, data_dirs, cache), s)
 
 
-def sweep(deadline=None, clock=time.monotonic, workers=None):
+def sweep(deadline=None, clock=time.monotonic, workers=None, record=True):
     """Reach a verdict on every open PR and return the Sweep. Prints nothing.
 
     `deadline` is a Budget: a `clock()` value past which the walk stops and
@@ -859,7 +892,7 @@ def sweep(deadline=None, clock=time.monotonic, workers=None):
     data_dirs = load_data_dirs()
     gate_cfg = load_gate_config()
     vis = repo_visibility() if ONLY_PUBLIC else {}
-    s = Sweep()
+    s = Sweep(record=record)
     workers = workers or DEFAULT_WORKERS
 
     e = enumerate_open_prs(deadline=deadline, clock=clock, workers=workers)
@@ -933,6 +966,9 @@ def main():
     dump("STALE BASE (rebase requested)", s.stale)
     dump("ROUTED to review", s.review)
     dump("SKIPPED (deliberately ungated repo)", s.skipped)
+    # Not labelled on the PR: drift is a fact about the repo's settings, and
+    # every PR in it would carry the same label for the same reason.
+    dump("DRIFT (auto-merge on, no correctness gate — fix the repo)", s.drift)
     if s.failed:
         dump("NO VERDICT — GitHub did not answer (retry; not a finding)", s.failed)
 
@@ -941,7 +977,8 @@ def main():
             sh("pr", "edit", str(num), "--repo", repo, "--add-label", NEEDS_REVIEW)
 
     print(f"merged={len(s.armed)} stale={len(s.stale)} review={len(s.review)} "
-          f"skipped={len(s.skipped)} no_verdict={len(s.failed)}")
+          f"skipped={len(s.skipped)} drift={len(s.drift)} "
+          f"no_verdict={len(s.failed)}")
     if s.failed:
         # Loud, because a partial sweep that looks complete is how a drained
         # queue gets reported while a fifth of it was never examined.

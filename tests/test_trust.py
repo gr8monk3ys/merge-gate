@@ -315,3 +315,107 @@ def _enum(prs):
     e = cp.Enumeration(sorted({p["repository"]["nameWithOwner"] for p in prs}))
     e.prs = list(prs)
     return e
+
+
+# --- item 3: a correctness gate is required --------------------------------
+
+@pytest.mark.parametrize("name,gate", [
+    ("ci", True), ("test (3.12)", True), ("Lint, Test & Build", True),
+    ("typecheck", True), ("e2e", True),
+    ("security-baseline", False), ("CodeQL", False), ("Analyze (python)", False),
+    ("Dependency Review / build", False),    # deny beats allow
+    ("ci-tests-minimum", False),              # runs nothing, cannot fail
+    ("Vercel – preview", False), ("extension", False),
+])
+def test_correctness_by_name(name, gate):
+    assert cp.is_correctness_check(name) is gate
+
+
+def test_a_declared_correctness_check_beats_both_lists():
+    assert cp.is_correctness_check("extension", ["extension"]) is True
+    assert cp.is_correctness_check("security-baseline", ["security-baseline"]) is True
+
+
+def test_the_predicate_matches_the_control_planes():
+    """Same lists as _fleet.is_correctness_check, checked when the control
+    plane is importable beside this checkout; skipped standalone."""
+    import importlib.util, os
+    path = os.path.expanduser("~/code/_orchestrator-automation/scripts/_fleet.py")
+    if not os.path.exists(path):
+        pytest.skip("control plane not present")
+    src = open(path).read()
+    for pat in cp.CORRECTNESS + cp.NOT_CORRECTNESS:
+        assert repr(pat) in src or f'r"{pat}"' in src, pat
+
+
+def test_auto_merge_with_only_a_security_check_is_drift(monkeypatch):
+    # fraud-stream: one required check, a security scan. Green says nothing
+    # about whether the code still works.
+    monkeypatch.setattr(mg, "sh_strict", _gh(_repo(["security-baseline"],
+                                                   [_run("security-baseline", "success")])))
+    monkeypatch.setattr(mg, "changed_paths", lambda *a: ["uv.lock"])
+    monkeypatch.setattr(mg, "DRY_RUN", False)
+    monkeypatch.setattr(mg, "sh", lambda *a: pytest.fail(f"wrote: {a}"))
+    s = mg.Sweep()
+    mg._evaluate(_bot_pr(), "o/r", 7, {}, s)
+    assert s.armed == [] and s.skipped == []
+    [(_, _, why, _)] = s.drift
+    assert why.startswith(mg.DRIFT) and "security-baseline" in why
+    assert "correctness_checks" in why
+    [row] = _rows()
+    assert row["decision"] == "DRIFT"
+
+
+def test_drift_does_not_read_check_runs(monkeypatch):
+    calls = []
+    fake = _gh(_repo(["CodeQL"], []))
+    monkeypatch.setattr(mg, "sh_strict", lambda *a: calls.append(" ".join(a)) or fake(*a))
+    st = mg.read_state("o/r", 7)
+    assert mg.judge(st)[1].startswith(mg.DRIFT)
+    assert not any("check-runs" in c for c in calls)
+
+
+def test_auto_merge_with_no_required_checks_is_drift_not_skipped(monkeypatch):
+    answers = [a for a in _repo([], []) if a[0] != "required_status_checks"]
+    monkeypatch.setattr(mg, "sh_strict", _gh([("required_status_checks", None)] + answers))
+    green, why = mg.judge(mg.read_state("o/r", 7))
+    assert green is None and why.startswith(mg.DRIFT) and "no required checks" in why
+
+
+def test_auto_merge_disabled_is_still_a_deliberate_skip(monkeypatch):
+    monkeypatch.setattr(mg, "sh_strict", _gh([
+        ("pulls/7 --jq .head.sha", "h7\nmain\nfalse\nclean\nbase0\n"),
+        (".allow_auto_merge", "false")]))
+    green, why = mg.judge(mg.read_state("o/r", 7))
+    assert green is None and not why.startswith(mg.DRIFT)
+
+
+def test_a_declared_gate_clears_drift(monkeypatch):
+    monkeypatch.setattr(mg, "sh_strict", _gh(_repo(["extension"], [_run("extension", "success")])))
+    assert mg.judge(mg.read_state("o/r", 7))[1].startswith(mg.DRIFT)
+    st = mg.read_state("o/r", 7, cfg={"correctness_checks": ["extension"]})
+    assert mg.judge(st)[0] is True
+
+
+def test_one_correctness_check_among_others_is_enough(monkeypatch):
+    runs = [_run("CodeQL", "success"), _run("build", "success")]
+    monkeypatch.setattr(mg, "sh_strict", _gh(_repo(["CodeQL", "build"], runs)))
+    assert mg.judge(mg.read_state("o/r", 7))[0] is True
+
+
+def test_drift_counts_as_a_verdict_and_is_reported(monkeypatch, capsys):
+    s = mg.Sweep()
+    s.drift.append(("o/r", 7, f"{mg.DRIFT} — x", "t"))
+    assert s.verdicts == 1
+    monkeypatch.setattr(mg, "sweep", lambda deadline=None: s)
+    monkeypatch.setattr(mg, "DRY_RUN", True)
+    mg.main()
+    out = capsys.readouterr().out
+    assert "=== DRIFT" in out and "drift=1" in out
+
+
+def test_a_sweep_can_be_asked_not_to_record(monkeypatch):
+    monkeypatch.setattr(mg, "sh_strict", _gh([(".auto_merge != null", "false")]))
+    monkeypatch.setattr(mg, "changed_paths", lambda *a: ["src/x.py"])
+    mg._evaluate(_bot_pr(), "o/r", 7, {}, mg.Sweep(record=False))
+    assert ledger.read() == ([], 0)
