@@ -14,14 +14,21 @@ each story.
 
 ## The rule
 
-Four conditions. All required. No overrides.
+Four conditions. All required. No overrides. (Then the circuit breakers
+below get a veto.)
 
 1. **The diff's shape is on the allowlist** — computed from the changed file
    paths, never from the title, the branch name, a label, or the loop that
    claims to have produced it.
 2. **The repo has at least one required status check that actually runs on
-   pull requests.** A shape match on an ungated repo does not merge.
-3. **Every required check is green at the exact commit that was judged**, and
+   pull requests, and at least one of them is a correctness gate** — a
+   test/build/lint/typecheck job, judged by name or declared in `repos.yml`
+   `correctness_checks`. A shape match on an ungated repo does not merge; a
+   repo with auto-merge on and only a security scan required is **DRIFT**.
+3. **Every required check is green at the exact commit that was judged** —
+   the newest run of each name, across every page of check runs; `skipped`
+   counts only for names the repo lists in `may_skip`; still-running is not
+   green — and
    that commit is what gets merged (`gh pr merge --match-head-commit`).
    Nothing is ever *armed*: an arm is standing permission to merge future
    content on the strength of a judgement about past content.
@@ -35,7 +42,7 @@ Four conditions. All required. No overrides.
 |---|---|---|
 | `lockfile-only` | only regenerated lockfiles changed **and** every version delta inside is patch/minor | a major hiding in `uv.lock` |
 | `dependency-bump` | manifest + lockfile, every delta patch/minor (read from the PR body — the title of a group bump names no versions) | any group containing a major, a `0.x` minor, or a SHA-only bump |
-| `tests-only` | every path is a test file | one source file alongside forty tests — there is no partial credit |
+| `tests-only` | every file is a **brand-new** test file (status `added` in the compare of exactly the judged base...head), none is harness/config, none shares a name with an existing path, and none contains a skip/xfail/`.only`/`pytestmark`/`SkipTest`/`__test__` marker or a duplicate test name | one source file alongside forty tests — there is no partial credit; **any change to an existing test file** (modified, removed, renamed, copied) routes to a human |
 | `data-artifact-only` | every path is inside a directory the repo has explicitly opted in via `data_dir` | anything, if the repo never opted in |
 | `ci-fix` | every added line matches an explicitly reviewed whitelist of action bumps | a workflow edit that merely *reads* like a fix |
 | `content` / `mixed` / `empty` / `unreadable` | — | always routed to a human |
@@ -43,6 +50,53 @@ Four conditions. All required. No overrides.
 A **content veto** sits on top of all of it: if any changed path is editorial
 content, the PR does not auto-merge whatever its shape. And an *unreadable*
 diff vetoes — "I could not check" never resolves to "there is nothing there".
+
+## Circuit breakers
+
+A green, allowlisted PR is still **HELD** — its own report section and
+ledger decision, never merged, applied in dry runs too — when:
+
+- the repo is paused in `repos.yml` (`merge_gate_paused: true`);
+- a **revert of a gate merge** was found on its base branch. Each sweep
+  starts by scanning every base branch the gate merged into in the last 14
+  days for `This reverts commit <sha>` naming a gate merge, or GitHub's
+  `Reverts owner/repo#N` naming a gate-merged PR, and records a pause in the
+  ledger. The pause clears **only** when that revert's sha is listed in the
+  repo's `merge_gate_ack_reverts`; time passing does not clear it. A repo
+  that could not be scanned this sweep is held for the sweep;
+- the repo already took `MERGE_GATE_MAX_PER_DAY` (default **3**; per repo
+  `merge_gate_max_per_day`) real gate merges in the last 24 hours, counted
+  from the ledger plus this sweep's own merges;
+- any correctness check on the base branch's head is red (newest run per
+  name; `cancelled` does not count).
+
+## Merge ledger
+
+Every verdict — merged, would-merge, stale, routed, skipped, drift, held,
+no verdict — appends one JSON line to `MERGE_GATE_LEDGER` (default
+`~/.local/state/fleet/merge-gate-ledger.jsonl`; `off` disables it, and a
+real run then refuses to start with exit `4`, because the breakers above
+read this file). A detected revert appends a `pause` row. Rows carry the
+repo, PR, judged head and base sha, shape, `tier` (the PR's bump severity,
+when it declares one), each required check's name/conclusion/app,
+`green_by_skip`, changed paths, `source` (dependabot / loop / other), the
+decision and reason, `dry_run`, the merge commit sha and the sweep's `run`
+id. A sample:
+
+```json
+{"artifacts":{"count":1,"paths":["uv.lock"]},"base_ref":"main","base_sha":"base0","checks":[{"app":"github-actions","conclusion":"success","name":"ci"},{"app":"github-actions","conclusion":"skipped","name":"test"}],"decision":"MERGED","dry_run":false,"event":"verdict","green_by_skip":true,"head_sha":"h7","merge_commit_sha":"9f2c1e7d4b3a0000000000000000000000000000","pr":7,"reason":"lockfile-only; green: ci, test (green by skip: test)","repo":"o/r","run":"20261115T081452Z-5","shape":"lockfile-only","source":"dependabot","tier":"patch","title":"bump x from 1.0.0 to 1.0.1","ts":"2026-11-15T08:14:52Z","v":1}
+```
+
+One writer (the sweep) appends under an exclusive lock, so a single file is
+safe. It is not the control plane's per-run Ledger (one committed file per
+loop run): that lives in another repository and a commit per sweep is the
+wrong cost for a record read back every half hour. To ingest it there, read
+the JSONL with `gate_ledger.read()` and record one summary per `run` id —
+for example `_ledger.record("merge-gate", "produced", "<n> merged",
+targets=[...repos merged...], counts={decision: n, ...})` — keyed on the
+last `run` already ingested, so each sweep lands exactly once.
+`sweep(record=False)` lets a read-only consumer ask the gate without
+appending.
 
 ## What it never does
 
@@ -57,7 +111,7 @@ diff vetoes — "I could not check" never resolves to "there is nothing there".
 ## Install
 
 ```sh
-pip install "merge-gate @ git+https://github.com/gr8monk3ys/merge-gate@v0.3.0"
+pip install "merge-gate @ git+https://github.com/gr8monk3ys/merge-gate@v0.9.0"
 ```
 
 That puts three console scripts on `PATH` — `merge-gate`, `ci-watchdog`,
@@ -77,8 +131,10 @@ merge-gate                             # report only — the default
 DRY_RUN=0 merge-gate                   # merge judged heads, label the rest
 ```
 
-The report separates *would merge* / *routed to review* / *skipped (ungated
-repo)* / *no verdict (GitHub did not answer — retry, not a finding)*.
+The report separates *would merge* / *stale base* / *routed to review* /
+*skipped (ungated repo)* / *drift (auto-merge on, no correctness gate)* /
+*held by circuit breaker* / *no verdict (GitHub did not answer — retry, not a
+finding)*.
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -89,6 +145,8 @@ repo)* / *no verdict (GitHub did not answer — retry, not a finding)*.
 | `SWEEP_BUDGET_SECONDS` | unset | Stop the walk after this many seconds and report what was reached. Checked while listing repos and before each PR is decided, never inside one. |
 | `GATE_WORKERS` | `8` | How many GitHub reads run at once: repo listings during enumeration, and per-PR reads during the sweep. Writes are always serial. |
 | `GATE_REPOS_YML` | `./repos.yml` | Path to the optional `repos.yml`. Absolute is safest — installed as a package there is no "next to the source file". |
+| `MERGE_GATE_LEDGER` | `~/.local/state/fleet/merge-gate-ledger.jsonl` | The merge ledger. `off` disables it (report-only runs only). |
+| `MERGE_GATE_MAX_PER_DAY` | `3` | Real gate merges per repo per rolling 24h; `repos.yml` `merge_gate_max_per_day` overrides per repo. |
 | `GH_TRANSPORT` | `auto` | `gh` forces the binary, `rest` forces the REST API. `auto` uses the binary only when it can actually authenticate. |
 
 ### Exit status
@@ -98,6 +156,7 @@ repo)* / *no verdict (GitHub did not answer — retry, not a finding)*.
 | `0` | The sweep ran and reached verdicts. It may still be incomplete — the report says so in its own section — but something was judged. | Nothing blocking was measured. |
 | `1` | — | A required check is red at an open PR's head: every merge in that repo is blocked. |
 | `3` | The budget ran out before a single PR was judged. The report prints `STOPPED AT BUDGET`, and the status is non-zero so a scheduler shows the run red instead of green over a sweep that did not happen. |
+| `4` | A real run (`DRY_RUN=0`) could not write the merge ledger, and refused to start. |
 
 ### How a sweep spends its budget
 
@@ -121,11 +180,14 @@ write and not against a value cached minutes earlier.
 | `verify-gates.py` | Does every *required* check actually fire on pull requests? A required check that only runs on push never goes green on a PR, so nothing can ever merge. (A script, not an importable module — it is not installed.) |
 | `gh_transport.py` | Can this environment reach GitHub at all, and by which route? `--whoami` answers; `--difftest` proves the two routes agree. |
 
-Optional: `repos.yml` (see `repos.example.yml`) declares `data_dir` opt-ins;
-it is looked for at `GATE_REPOS_YML`, else `repos.yml` in the working
-directory.
-Nothing else is configuration; the policy is three constants at the top of
-`classify_pr.py`, and changing what merges is a one-line, deliberate edit.
+Optional: `repos.yml` (see `repos.example.yml`), looked for at
+`GATE_REPOS_YML`, else `repos.yml` in the working directory. Per repo it
+reads `data_dir` (opt-in data paths), `may_skip` (required checks that may
+pass as skipped), `correctness_checks` (check names that are gates despite
+their names), `merge_gate_max_per_day`, `merge_gate_paused` and
+`merge_gate_ack_reverts`. Every absent field is the strict value. The
+merge policy itself is constants at the top of `classify_pr.py`, and
+changing what merges is a one-line, deliberate edit.
 
 ## Transport: the gate must run where `gh` does not
 

@@ -3,10 +3,18 @@
 
 Four conditions, ALL required, no overrides:
 
-  1. diff shape is on the allowlist and carries no content veto
-  2. the repo has >= 1 required status check on the base branch
-  3. every required check is currently green
+  1. diff shape is on the allowlist and carries no content veto (and a
+     tests-only diff only ADDS new test files, judged at the merged head)
+  2. the repo has >= 1 required status check on the base branch, and at
+     least one of them is a correctness gate (else: DRIFT)
+  3. every required check is currently green -- newest run per name,
+     `skipped` only where repos.yml `may_skip` allows it
   4. those checks ran against the base branch's CURRENT head
+
+Then the circuit breakers (breaker_reason) can still HOLD a green PR: a
+paused repo, an unacknowledged revert of a gate merge, the per-repo daily
+merge cap, or a red base. Every verdict is appended to the merge ledger
+(gate_ledger.py), which is where the cap and the revert history come from.
 
 Condition 2 is the one that was missing and is why dotfiles#41 merged with
 "no checks reported". A shape match on an ungated repo does NOT merge — it
@@ -38,17 +46,20 @@ public repos first spends nothing.
 import datetime as dt
 import json
 import os
+import re
 import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import gate_ledger as ledger  # noqa: E402
 from classify_pr import (  # noqa: E402
     DEFAULT_WORKERS, Abandoned, _run_gh, auto_mergeable, bail_if, bump_kind,
     changed_paths, classify, conflict_self_heals, content_veto,
-    enumerate_open_prs, is_conflict, is_dependabot, load_data_dirs,
-    promote_candidate, repo_visibility,
+    enumerate_open_prs, is_conflict, is_correctness_check, is_dependabot,
+    load_data_dirs, load_gate_config, promote_candidate, repo_visibility,
+    tests_only_veto,
 )
 
 DRY_RUN = os.environ.get("DRY_RUN", "1") != "0"
@@ -62,6 +73,12 @@ NEEDS_REVIEW = "needs-review"
 # green: a sweep that judged nothing and said so quietly is a sweep nobody
 # notices did not happen.
 EXIT_NO_VERDICTS = 3
+# Exit status when a real run (DRY_RUN=0) cannot write its merge ledger. The
+# rate and revert breakers are computed from that file; a gate that cannot
+# record its merges cannot count them, so it refuses to start.
+EXIT_NO_LEDGER = 4
+# How many changed paths a ledger row carries. The count is always exact.
+LEDGER_MAX_PATHS = 50
 # Prose for the report, but compared by code: this token links check_state's
 # conflict verdict to the self-heal in _evaluate. One definition, or a wording
 # tweak silently disables the rebase kick with no failure signal.
@@ -69,6 +86,25 @@ CONFLICTING = "CONFLICTING with base"
 # Same contract: a prefix _evaluate matches on to decide who gets the rebase
 # kick. Reworded here, silently nobody is asked to rebase.
 STALE_BASE = "STALE BASE"
+# Same contract again: the prefix _decide files under `drift` rather than
+# `skipped`. A repo that permits auto-merge but has no correctness gate is
+# not "deliberately ungated" -- it is a Phase 1 setting that no longer
+# matches the repo, and it needs a person to fix the setting or the gate.
+DRIFT = "DRIFT"
+# Prefix of every circuit-breaker hold. A held PR is green and allowlisted;
+# something about the REPO says not now (see breaker_reason).
+HELD = "HELD"
+# Gate merges allowed per repo per rolling 24h, unless MERGE_GATE_MAX_PER_DAY
+# or the repo's merge_gate_max_per_day says otherwise.
+DEFAULT_MAX_PER_DAY = 3
+# How far back revert detection looks for gate merges to protect.
+REVERT_LOOKBACK_DAYS = 14
+# Base-branch conclusions that mean "main is broken". `cancelled` is not one:
+# concurrency groups cancel superseded runs on main all day, and the newest
+# run of the same name is what is read anyway.
+BASE_RED = {"failure", "timed_out", "action_required", "startup_failure"}
+_RE_REVERTS_SHA = re.compile(r"This reverts commit ([0-9a-f]{7,40})", re.I)
+_RE_REVERTS_PR = re.compile(r"\bReverts ([\w.-]+/[\w.-]+)#(\d+)")
 REBASE_NAG_HOURS = 24  # at most one @dependabot rebase request per PR per day
 
 
@@ -189,6 +225,58 @@ def auto_merge_allowed(repo):
     return out.strip() == "true"
 
 
+def check_runs(repo, sha):
+    """Every check run on `sha`, across every page. Raises ReadFailed.
+
+    The check-runs endpoint pages at 30 by default. It used to be read as one
+    page, so a commit with more than 30 runs -- a matrix build is enough --
+    could have its required check on page two, read as "not run", or worse,
+    have only an older attempt of it visible. `--paginate` with a
+    per-page projection emits one JSON array per page, one per line (§23).
+    """
+    out = sh_strict("api", f"repos/{repo}/commits/{sha}/check-runs?per_page=100",
+                    "--paginate", "--jq",
+                    "[.check_runs[]|{id,name,status,conclusion,started_at,"
+                    "completed_at,app:.app.slug}]")
+    if out is None:
+        raise ReadFailed(f"{repo}: check-runs not found for {sha[:8]}")
+    runs = []
+    for line in out.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            page = json.loads(line)
+        except json.JSONDecodeError:
+            raise ReadFailed(f"{repo}: unparseable check-runs for {sha[:8]}")
+        if not isinstance(page, list):
+            raise ReadFailed(f"{repo}: unexpected check-runs shape for {sha[:8]}")
+        runs.extend(r for r in page if isinstance(r, dict))
+    return runs
+
+
+def _run_age(run):
+    """Sort key: newer runs sort higher. completed_at, else started_at (an
+    in-flight re-run has no completed_at yet), then id as the tiebreak --
+    ids are allocated in creation order."""
+    return (run.get("completed_at") or run.get("started_at") or "",
+            run.get("id") or 0)
+
+
+def latest_by_name(runs):
+    """{name: newest run}. A re-run creates a second run with the same name;
+    keeping whichever the API listed last let a stale success shadow a newer
+    failure, or the reverse."""
+    out = {}
+    for r in runs:
+        name = r.get("name")
+        if name is None:
+            continue
+        if name not in out or _run_age(r) > _run_age(out[name]):
+            out[name] = r
+    return out
+
+
 def base_head(repo, branch):
     out = sh_strict("api", f"repos/{repo}/branches/{branch}", "--jq", ".commit.sha")
     if out is None:
@@ -210,9 +298,15 @@ class RepoCache:
     as before.
     """
 
-    def __init__(self):
+    def __init__(self, gate_cfg=None):
         self._vals, self._locks = {}, {}
         self._lock = threading.Lock()
+        # repos.yml's per-repo gate settings (load_gate_config), keyed by bare
+        # repo name. Configuration, not a read: it is fixed for the sweep.
+        self.gate_cfg = gate_cfg or {}
+
+    def config(self, repo):
+        return self.gate_cfg.get(repo.split("/")[-1]) or {}
 
     def get(self, key, read):
         with self._lock:
@@ -265,19 +359,72 @@ class State:
     are never fetched, exactly as before.
     """
 
-    def __init__(self, repo, number, sha, base, base_sha, draft, mstate):
+    def __init__(self, repo, number, sha, base, base_sha, draft, mstate,
+                 cfg=None):
         self.repo, self.number = repo, number
         self.sha, self.base, self.base_sha = sha, base, base_sha
         self.draft = draft.strip().lower() == "true"
         self.conflict = is_conflict(mstate)
+        cfg = self.cfg = cfg or {}
+        self.may_skip = list(cfg.get("may_skip") or [])
+        self.declared = list(cfg.get("correctness_checks") or [])
         self.allow_auto: bool | None = None       # repo permits auto-merge
         self.required: list | None = None         # required contexts on base
         self.missing: list | None = None          # required, no check-run
         self.failed: list | None = None           # required, run is red
+        self.pending: list | None = None          # required, not finished
+        self.skipped: list | None = None          # required, skipped, not allowed
+        self.green_by_skip = False                # a may_skip check passed as skipped
+        self.checks: list = []                    # [{name, conclusion, app}] per required
         self.branch_head: str | None = None       # where base was when read
+        self.base_red: list = []                  # correctness checks red on base
+
+    @property
+    def correctness(self):
+        """The required checks that are gates on the code still working."""
+        return [c for c in self.required or []
+                if is_correctness_check(c, self.declared)]
 
 
-def read_state(repo, number, cache=None, stop=None):
+def grade_checks(st, latest):
+    """Sort each required check into exactly one bucket on `st`.
+
+    Three ways a required check used to count as green that it was not:
+
+      * `skipped` passed unconditionally. A path-filtered job that did not
+        run verified nothing, and a required test job that skips on a
+        tests-only diff is the very job that should have run. It now passes
+        only when the repo lists it in `may_skip`, and the PR then records
+        `green_by_skip` so the ledger shows which merges rode on one.
+      * a run still in progress (conclusion null) was neither missing nor
+        failed, so it fell through as green.
+      * duplicate names resolved last-listed-wins; `latest` is newest-wins.
+    """
+    st.missing, st.failed, st.pending, st.skipped = [], [], [], []
+    st.green_by_skip, st.checks = False, []
+    for c in st.required:
+        run = latest.get(c)
+        if run is None:
+            st.missing.append(c)
+            st.checks.append({"name": c, "conclusion": "missing", "app": None})
+            continue
+        concl = run.get("conclusion")
+        st.checks.append({"name": c, "conclusion": concl or run.get("status")
+                          or "pending", "app": run.get("app")})
+        if concl is None:
+            st.pending.append(c)
+        elif concl == "success":
+            pass
+        elif concl == "skipped":
+            if c in st.may_skip:
+                st.green_by_skip = True
+            else:
+                st.skipped.append(c)
+        else:
+            st.failed.append(c)
+
+
+def read_state(repo, number, cache=None, stop=None, cfg=None):
     """Read everything judge() needs about one PR. Raises ReadFailed.
 
     Per-repo facts go through `cache`; per-PR facts are read every time.
@@ -285,6 +432,7 @@ def read_state(repo, number, cache=None, stop=None):
     an ungated repo still costs one call, not five.
     """
     cache = cache if cache is not None else RepoCache()
+    cfg = cfg if cfg is not None else cache.config(repo)
     out = sh_strict("api", f"repos/{repo}/pulls/{number}",
                     "--jq", ".head.sha,.base.ref,.draft,.mergeable_state,.base.sha")
     if out is None:
@@ -293,7 +441,7 @@ def read_state(repo, number, cache=None, stop=None):
     if len(lines) < 5:
         raise ReadFailed(f"{repo}#{number}: short response from pulls endpoint")
     sha, base, draft, mstate, base_sha = lines[:5]
-    st = State(repo, number, sha, base, base_sha, draft, mstate)
+    st = State(repo, number, sha, base, base_sha, draft, mstate, cfg)
 
     # A draft can never merge and can never be armed, however green it is.
     # 22 of 56 open PRs sat in this state while pr-shepherd reported them as
@@ -310,7 +458,7 @@ def read_state(repo, number, cache=None, stop=None):
     bail_if(stop)
     st.required = cache.get(("required_checks", repo, base),
                             lambda: required_checks(repo, base))
-    if not st.required:
+    if not st.required or not st.correctness:
         return st
 
     # An armed PR that goes CONFLICTING sits forever: auto-merge can never
@@ -322,19 +470,10 @@ def read_state(repo, number, cache=None, stop=None):
         return st
 
     bail_if(stop)
-    out = sh_strict("api", f"repos/{repo}/commits/{sha}/check-runs",
-                    "--jq", "[.check_runs[]|{name,conclusion}]")
-    if out is None:
-        raise ReadFailed(f"{repo}#{number}: check-runs not found for {sha[:8]}")
     # An empty list here is a real answer: no check has reported yet. That
     # lands in judge() as "required check(s) not run", which blocks.
-    runs = json.loads(out) if out else []
-    by_name = {r["name"]: r["conclusion"] for r in runs}
-    st.missing = [c for c in st.required if c not in by_name]
-    st.failed = [c for c in st.required
-                 if by_name.get(c) not in (None, "success", "skipped")
-                 and c in by_name]
-    if st.missing or st.failed:
+    grade_checks(st, latest_by_name(check_runs(repo, sha)))
+    if st.missing or st.failed or st.pending or st.skipped:
         return st
 
     # Green -- against which base? Read only for a green PR, so a red one
@@ -343,6 +482,19 @@ def read_state(repo, number, cache=None, stop=None):
     bail_if(stop)
     st.branch_head = cache.get(("base_head", repo, base),
                                lambda: base_head(repo, base))
+
+    # Is the base itself broken? Merging onto a red main stacks a change on
+    # a failure nobody has diagnosed, and a green PR proves nothing there:
+    # its checks ran against a base that already did not work. Every
+    # correctness check on the base head counts, required or not. Cached per
+    # base head, so a repo's base is read once however many PRs sit on it.
+    bail_if(stop)
+    runs = cache.get(("base_runs", repo, st.branch_head),
+                     lambda: check_runs(repo, st.branch_head))
+    st.base_red = sorted(
+        name for name, run in latest_by_name(runs).items()
+        if run.get("conclusion") in BASE_RED
+        and is_correctness_check(name, st.declared))
     return st
 
 
@@ -359,21 +511,38 @@ def judge(st, moved=frozenset()):
         return None, "DRAFT — cannot merge until marked ready"
     if not st.allow_auto:
         return None, "repo has auto-merge disabled (no real test gate)"
+    # allow_auto_merge is Phase 1's assertion that a real test gate exists.
+    # When the required checks do not bear that out, the assertion has
+    # drifted: fraud-stream's lone required `security-baseline` is green on
+    # code that does not build. Not a merge, and not "deliberately ungated".
     if not st.required:
-        return None, f"no required checks on {st.base}"
+        return None, (f"{DRIFT} — allow_auto_merge is on but {st.base} has "
+                      "no required checks")
+    if not st.correctness:
+        return None, (f"{DRIFT} — allow_auto_merge is on but no required check "
+                      f"on {st.base} is a correctness gate "
+                      f"(required: {', '.join(st.required)}; declare real gates "
+                      "in repos.yml correctness_checks)")
     if st.conflict:
         return False, CONFLICTING
     if st.missing:
         return False, f"required check(s) not run: {', '.join(st.missing)}"
     if st.failed:
         return False, f"required check(s) red: {', '.join(st.failed)}"
+    if st.skipped:
+        return False, ("required check(s) skipped, and not in this repo's "
+                       f"may_skip: {', '.join(st.skipped)}")
+    if st.pending:
+        return False, f"required check(s) still running: {', '.join(st.pending)}"
     # Checked last so a red PR is still reported as red: that is the finding
     # a reader can act on, and a rebase would only re-run the same red checks.
     stale = stale_base_reason(st.repo, st.base, st.base_sha, moved,
                               head=st.branch_head)
     if stale:
         return False, stale
-    return True, f"green: {', '.join(st.required)}"
+    skipped = [c["name"] for c in st.checks if c["conclusion"] == "skipped"]
+    return True, (f"green: {', '.join(st.required)}"
+                  + (f" (green by skip: {', '.join(skipped)})" if skipped else ""))
 
 
 def check_state(repo, number, moved=frozenset(), cache=None):
@@ -430,9 +599,23 @@ class Sweep:
     describing the sweep that put finance-owl's main in the red.
     """
 
-    def __init__(self):
+    def __init__(self, record=True):
         self.armed, self.review, self.skipped = [], [], []
         self.stale, self.failed = [], []
+        self.drift = []      # auto-merge on, no correctness gate: see DRIFT
+        self.held = []       # green, but a circuit breaker said not now
+        # The merge ledger as read at the start of the sweep, plus any pause
+        # rows this sweep's revert scan added. Read lazily for callers that
+        # judge single PRs. This sweep's own merges are counted from `armed`.
+        self.history = None
+        # Repos whose revert scan GitHub did not answer: merges there are
+        # held, because "could not check for a revert" is not "no revert".
+        self.unscanned = set()
+        # Whether verdicts are appended to the merge ledger. sweep(record=False)
+        # lets a read-only consumer (a dashboard) ask without writing.
+        self.record = record
+        self.run_id = (dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+                       + f"-{os.getpid()}")
         self.moved = set()   # {(repo, base_ref)}
         # Set when a Budget stopped the walk early. `unreached` is what was
         # left, so a caller can say how much of the queue it never looked at
@@ -446,12 +629,20 @@ class Sweep:
         self.repos_total = 0
         self.repos_unreached = 0
         self.repos_unlisted = []
+        # Ledger appends that failed. Loud in the report; see _record().
+        self.ledger_errors = []
 
     @property
     def verdicts(self):
         """Rows that state a decision. `failed` is not one: it says GitHub
         did not answer, which is the absence of a verdict, not a verdict."""
-        return len(self.armed) + len(self.stale) + len(self.review) + len(self.skipped)
+        return (len(self.armed) + len(self.stale) + len(self.review)
+                + len(self.skipped) + len(self.drift) + len(self.held))
+
+    def rows(self):
+        if self.history is None:
+            self.history = ledger.read()[0]
+        return self.history
 
 
 class Reading:
@@ -473,6 +664,14 @@ class Reading:
         self.why: str | None = None        # review reason, when not mergeable
         self.armed = False                 # GitHub has an arm on this PR
         self.state: State | None = None    # read when mergeable
+        self.paths: list | None = None     # changed paths; None = unreadable
+        self.source = pr_source(pr)        # dependabot | loop | other
+        # The PR's own bump severity (patch/minor/...), when it declares one.
+        # Recorded as the ledger's `tier`: how far the code moved.
+        self.tier: str | None = None
+        self.head_sha: str | None = None   # head when the arm was read
+        self.base_ref: str | None = None
+        self.base_sha: str | None = None
 
 
 def _read(pr, repo, num, data_dirs, cache=None, stop=None):
@@ -485,8 +684,9 @@ def _read(pr, repo, num, data_dirs, cache=None, stop=None):
     cache = cache if cache is not None else RepoCache()
     r = Reading(pr, repo, num)
     bail_if(stop)
-    paths = changed_paths(repo, num)
+    paths = r.paths = changed_paths(repo, num)
     title, body = r.title, pr.get("body", "") or ""
+    r.tier = bump_kind(title, body)
     # classify() reads paths only; the version judgement needs the PR text.
     r.shape = promote_candidate(
         classify(paths, data_dirs.get(repo.split("/")[1])), title, body)
@@ -511,13 +711,298 @@ def _read(pr, repo, num, data_dirs, cache=None, stop=None):
     # allowlist is drift to correct, and an arm on an allowlisted PR is a
     # standing permission to retire (see _decide).
     bail_if(stop)
+    # The same read carries the head and base the ledger records for PRs that
+    # never reach read_state(): every row names the commit it was about.
     out = sh_strict("api", f"repos/{repo}/pulls/{num}",
-                    "--jq", ".auto_merge != null")
-    r.armed = out is not None and out.strip() == "true"
+                    "--jq", ".auto_merge != null,.head.sha,.base.ref,.base.sha")
+    lines = (out or "").splitlines()
+    r.armed = bool(lines) and lines[0].strip() == "true"
+    if len(lines) >= 4:
+        r.head_sha, r.base_ref, r.base_sha = (x.strip() for x in lines[1:4])
 
     if r.mergeable:
         r.state = read_state(repo, num, cache, stop)
+
+    # tests-only is a claim about paths. What the diff does to the tests is a
+    # claim about content, and no denylist of skip idioms is complete
+    # (aliased marks, SkipTest, `__test__ = False`, a shadowing duplicate
+    # name, an early return), so the rule is structural: only brand-new test
+    # files merge. It is judged from the compare API for exactly
+    # base_sha...head_sha, where head_sha is read_state's ONE read of the
+    # head -- the same sha --match-head-commit merges. Nothing re-reads it.
+    if r.mergeable and r.shape == "tests-only":
+        st = r.state
+        bail_if(stop)
+        files = compare_files(repo, st.base_sha, st.sha)
+        names = sorted(f.get("filename") or "" for f in files)
+        if names != sorted(paths):
+            # The PR moved between the path read and the head read. Judge it
+            # next sweep, whole, rather than on half of each.
+            raise ReadFailed(f"{repo}#{num}: diff at {st.sha[:8]} is not the "
+                             "diff that was classified")
+        bail_if(stop)
+        existing = cache.get(("tree", repo, st.base_sha),
+                             lambda: base_tree_paths(repo, st.base_sha))
+        veto = tests_only_veto(files, existing)
+        if veto:
+            r.mergeable = False
+            r.why = f"tests-only rejected: {veto}"
     return r
+
+
+def max_per_day(cfg):
+    """The repo's rolling-24h gate-merge cap: repos.yml, else env, else 3.
+    An unreadable value falls back to the default, never to "unlimited"."""
+    for raw in ((cfg or {}).get("merge_gate_max_per_day"),
+                os.environ.get("MERGE_GATE_MAX_PER_DAY", "").strip() or None):
+        if raw is None:
+            continue
+        try:
+            return max(0, int(raw))
+        except (TypeError, ValueError):
+            return DEFAULT_MAX_PER_DAY
+    return DEFAULT_MAX_PER_DAY
+
+
+def _sha_match(a, b):
+    a, b = (a or "").lower(), (b or "").lower()
+    return len(a) >= 7 and len(b) >= 7 and (a.startswith(b) or b.startswith(a))
+
+
+def active_pauses(rows, repo, acked=()):
+    """Revert pauses for `repo` that no human has acknowledged. A pause
+    clears only when its revert sha is listed in merge_gate_ack_reverts:
+    a later sweep finding nothing new does not clear it, and neither does
+    time."""
+    return [p for p in ledger.pauses(rows, repo)
+            if not any(_sha_match(p.get("revert_sha"), a) for a in acked or ())]
+
+
+def breaker_reason(st, s, now=None):
+    """Why a green, allowlisted PR must still not merge now, or None.
+
+    Every reason starts with HELD. Checked in order of how much a human
+    must do: a pause needs repos.yml edited, a rate hold clears with time,
+    a red base clears when the base is fixed. Applied in DRY_RUN too, so a
+    report describes the run a real one would perform.
+    """
+    now = now or dt.datetime.now(dt.timezone.utc)
+    repo, cfg = st.repo, st.cfg or {}
+    if cfg.get("merge_gate_paused"):
+        return f"{HELD} — PAUSED by repos.yml (merge_gate_paused: true)"
+    rows = s.rows()
+    paused = active_pauses(rows, repo, cfg.get("merge_gate_ack_reverts"))
+    if paused:
+        p = paused[-1]
+        return (f"{HELD} — PAUSED: {p.get('revert_sha', '?')[:12]} on "
+                f"{p.get('base_ref') or st.base} reverts gate merge "
+                f"{(p.get('reverted_sha') or '?')[:12]} (#{p.get('pr')}); add "
+                f"{p.get('revert_sha', '?')[:12]} to merge_gate_ack_reverts in "
+                "repos.yml to resume")
+    if repo in s.unscanned:
+        return (f"{HELD} — could not scan {st.base} for reverts of gate merges "
+                "this sweep (GitHub did not answer)")
+    limit = max_per_day(cfg)
+    since = now - dt.timedelta(hours=24)
+    done = (len(ledger.real_merges(rows, repo, since=since))
+            + sum(1 for row in s.armed if row[0] == repo))
+    if done >= limit:
+        return (f"{HELD} — merge rate: {done} gate merge(s) in {repo} in the "
+                f"last 24h, limit {limit}")
+    if st.base_red:
+        return (f"{HELD} — {st.base} is red at {(st.branch_head or '?')[:8]}: "
+                f"{', '.join(st.base_red)}")
+    if s.ledger_errors and not DRY_RUN:
+        return f"{HELD} — the merge ledger stopped accepting writes this sweep"
+    return None
+
+
+def _parse_pages(out):
+    """Concatenated JSON documents (gh --paginate output) as a list of them."""
+    dec, i, docs = json.JSONDecoder(), 0, []
+    out = out or ""
+    while True:
+        while i < len(out) and out[i].isspace():
+            i += 1
+        if i >= len(out):
+            return docs
+        doc, i = dec.raw_decode(out, i)
+        docs.append(doc)
+
+
+def branch_commits(repo, branch, since):
+    """[(sha, message)] on `branch` since an ISO time. Raises ReadFailed."""
+    out = sh_strict("api", f"repos/{repo}/commits?sha={branch}&since={since}"
+                           "&per_page=100", "--paginate")
+    if out is None:
+        raise ReadFailed(f"{repo}: branch {branch} not found")
+    try:
+        pages = _parse_pages(out)
+    except json.JSONDecodeError:
+        raise ReadFailed(f"{repo}: unparseable commit list for {branch}")
+    commits = []
+    for page in pages:
+        for c in page if isinstance(page, list) else []:
+            commits.append((c.get("sha") or "",
+                            ((c.get("commit") or {}).get("message") or "")))
+    return commits
+
+
+def detect_reverts(rows, now=None, read=branch_commits):
+    """Scan each base branch the gate merged into for reverts of its merges.
+
+    Returns (new pause rows, repos that could not be scanned). A revert is
+    recognised by git's own "This reverts commit <sha>" naming a gate merge
+    (its merge commit or judged head), or by GitHub's revert-PR body
+    "Reverts owner/repo#N" naming a gate-merged PR. A revert already
+    recorded is not recorded again. Only real merges are protected; a
+    dry run merged nothing. The sweep calls this before deciding anything.
+    """
+    now = now or dt.datetime.now(dt.timezone.utc)
+    since = now - dt.timedelta(days=REVERT_LOOKBACK_DAYS)
+    merges = ledger.real_merges(rows, since=since)
+    seen = {(p.get("repo"), p.get("revert_sha")) for p in ledger.pauses(rows)}
+    targets = {}
+    for m in merges:
+        if m.get("repo") and m.get("base_ref"):
+            targets.setdefault((m["repo"], m["base_ref"]), []).append(m)
+    found, unscanned = [], set()
+    for (repo, base_ref), ms in sorted(targets.items()):
+        first = min(m.get("ts") or ledger.now_iso(since) for m in ms)
+        try:
+            commits = read(repo, base_ref, first)
+        except ReadFailed:
+            unscanned.add(repo)
+            continue
+        for sha, msg in commits:
+            if (repo, sha) in seen:
+                continue
+            shas = _RE_REVERTS_SHA.findall(msg)
+            prs = {int(n) for r, n in _RE_REVERTS_PR.findall(msg)
+                   if r.lower() == repo.lower()}
+            hit = next((m for m in ms
+                        if m.get("pr") in prs
+                        or any(_sha_match(s_, m.get("merge_commit_sha"))
+                               or _sha_match(s_, m.get("head_sha")) for s_ in shas)),
+                       None)
+            if hit is None:
+                continue
+            seen.add((repo, sha))
+            found.append({
+                "event": "pause", "repo": repo, "base_ref": base_ref,
+                "revert_sha": sha, "pr": hit.get("pr"),
+                "reverted_sha": hit.get("merge_commit_sha") or hit.get("head_sha"),
+                "reason": (f"{sha[:12]} on {base_ref} reverts gate merge of "
+                           f"#{hit.get('pr')}"),
+            })
+    return found, unscanned
+
+
+# GitHub's compare endpoint lists at most this many files. A list that long
+# may be cut short, and a short list could hide the file that matters.
+COMPARE_FILE_CAP = 300
+
+
+def compare_files(repo, base_sha, head_sha):
+    """Changed files (filename, status, patch, previous_filename) between two
+    exact commits, from `compare/{base}...{head}`. Raises ReadFailed.
+
+    Both ends are shas, not refs: the answer describes one commit range and
+    cannot move under the caller the way pulls/{n}/files can.
+    """
+    out = sh_strict("api", f"repos/{repo}/compare/{base_sha}...{head_sha}")
+    if out is None:
+        raise ReadFailed(f"{repo}: compare {base_sha[:8]}...{head_sha[:8]} not found")
+    try:
+        doc = json.loads(out)
+    except json.JSONDecodeError:
+        raise ReadFailed(f"{repo}: unparseable compare {base_sha[:8]}...{head_sha[:8]}")
+    files = doc.get("files") if isinstance(doc, dict) else None
+    if not isinstance(files, list):
+        raise ReadFailed(f"{repo}: compare {base_sha[:8]}...{head_sha[:8]} has no files")
+    if len(files) >= COMPARE_FILE_CAP:
+        raise ReadFailed(f"{repo}: compare lists {len(files)} files, possibly truncated")
+    return [f for f in files if isinstance(f, dict)]
+
+
+def base_tree_paths(repo, sha):
+    """Every path in the tree at `sha`, or None when GitHub truncated the
+    listing -- None is "could not check for a name collision", and
+    tests_only_veto refuses on it. Raises ReadFailed when unread."""
+    out = sh_strict("api", f"repos/{repo}/git/trees/{sha}?recursive=1")
+    if out is None:
+        raise ReadFailed(f"{repo}: tree {sha[:8]} not found")
+    try:
+        doc = json.loads(out)
+    except json.JSONDecodeError:
+        raise ReadFailed(f"{repo}: unparseable tree {sha[:8]}")
+    if not isinstance(doc, dict) or doc.get("truncated"):
+        return None
+    return [e.get("path") for e in doc.get("tree") or []
+            if isinstance(e, dict) and e.get("path")]
+
+
+def pr_source(pr):
+    """Who produced this PR: dependabot | loop | other. For the ledger;
+    the gate's own eligibility rule is is_loop_produced()."""
+    if is_dependabot(pr):
+        return "dependabot"
+    labels = [l.get("name") for l in pr.get("labels") or []]
+    if "automated" in labels or (pr.get("headRefName") or "").startswith("auto/"):
+        return "loop"
+    return "other"
+
+
+def ledger_row(r, decision, reason, merge_commit_sha=None):
+    """The one structured record of a verdict. Pure."""
+    st = getattr(r, "state", None)
+    paths = getattr(r, "paths", None)
+    pr = getattr(r, "pr", {}) or {}
+    return {
+        "event": "verdict",
+        "repo": r.repo, "pr": r.num, "title": getattr(r, "title", ""),
+        "source": getattr(r, "source", None) or pr_source(pr),
+        "shape": getattr(r, "shape", None),
+        "tier": getattr(r, "tier", None),
+        # What the PR is about: its judged head, and the base its checks saw.
+        "head_sha": st.sha if st else getattr(r, "head_sha", None),
+        "base_ref": st.base if st else getattr(r, "base_ref", None),
+        "base_sha": st.base_sha if st else getattr(r, "base_sha", None),
+        "checks": list(st.checks) if st else [],
+        "green_by_skip": bool(st.green_by_skip) if st else False,
+        "artifacts": {"count": None if paths is None else len(paths),
+                      "paths": (paths or [])[:LEDGER_MAX_PATHS]},
+        "decision": decision, "reason": reason,
+        "dry_run": DRY_RUN,
+        "merge_commit_sha": merge_commit_sha,
+    }
+
+
+def _record(s, row):
+    """Append a row; a failure is kept on the Sweep and reported, never
+    swallowed. The verdict itself has already been reached and stands."""
+    if not s.record:
+        return
+    try:
+        ledger.append({**row, "run": s.run_id})
+    except ledger.LedgerError as exc:
+        s.ledger_errors.append(str(exc))
+
+
+def _file(s, bucket, r, detail, decision, merge_commit_sha=None):
+    """File one verdict row on the Sweep AND in the ledger. Every verdict
+    goes through here, so the two cannot disagree about what was decided."""
+    getattr(s, bucket).append((r.repo, r.num, detail, r.title))
+    _record(s, ledger_row(r, decision, detail, merge_commit_sha))
+
+
+def _merge_commit_sha(repo, num):
+    """The commit a merge put on the base, or None. Best-effort: the merge
+    has already happened, so a blipped read must not un-decide it. Revert
+    detection also matches the judged head and the PR number."""
+    code, out, _ = sh("api", f"repos/{repo}/pulls/{num}", "--jq", ".merge_commit_sha")
+    out = (out or "").strip()
+    return out if code == 0 and out and out != "null" else None
 
 
 def _disarm(repo, num):
@@ -545,7 +1030,7 @@ def _decide(r, s):
         if r.armed:
             why += " — DISARMED (was armed outside the allowlist)"
             _disarm(repo, num)
-        s.review.append((repo, num, why, title))
+        _file(s, "review", r, why, ledger.ROUTED)
         return
 
     # Standing arms are retired, allowlisted shape or not. An arm outlives
@@ -562,8 +1047,17 @@ def _decide(r, s):
     sha, base = st.sha, st.base
 
     if green is None:
-        s.skipped.append((repo, num, detail, title))
+        if detail.startswith(DRIFT):
+            _file(s, "drift", r, detail, ledger.DRIFT)
+        else:
+            _file(s, "skipped", r, detail, ledger.SKIPPED)
         return
+
+    if green:
+        held = breaker_reason(st, s)
+        if held:
+            _file(s, "held", r, held, ledger.HELD)
+            return
 
     if green and not DRY_RUN:
         # The base head in `st` was read once per repo, possibly minutes ago
@@ -591,9 +1085,9 @@ def _decide(r, s):
         if kick:
             detail += request_rebase(repo, num)
         if detail.startswith(STALE_BASE) and kick:
-            s.stale.append((repo, num, detail, title))
+            _file(s, "stale", r, detail, ledger.STALE)
         else:
-            s.review.append((repo, num, detail, title))
+            _file(s, "review", r, detail, ledger.ROUTED)
         return
 
     if not DRY_RUN:
@@ -605,9 +1099,11 @@ def _decide(r, s):
         code, _, err = sh("pr", "merge", str(num), "--repo", repo,
                           "--squash", "--match-head-commit", sha)
         if code != 0:
-            s.skipped.append((repo, num, f"merge refused: {err[:60]}", title))
+            _file(s, "skipped", r, f"merge refused: {err[:60]}", ledger.SKIPPED)
             return
-    s.armed.append((repo, num, f"{r.shape}; {detail}", title))
+    _file(s, "armed", r, f"{r.shape}; {detail}",
+          ledger.WOULD_MERGE if DRY_RUN else ledger.MERGED,
+          None if DRY_RUN else _merge_commit_sha(repo, num))
     # This merge moved the base. Every candidate still to come on it was
     # judged -- by GitHub, when its checks ran -- against the base that no
     # longer exists. #145 landed 21 seconds after #148 that way.
@@ -624,7 +1120,7 @@ def _evaluate(pr, repo, num, data_dirs, s, cache=None):
     _decide(_read(pr, repo, num, data_dirs, cache), s)
 
 
-def sweep(deadline=None, clock=time.monotonic, workers=None):
+def sweep(deadline=None, clock=time.monotonic, workers=None, record=True):
     """Reach a verdict on every open PR and return the Sweep. Prints nothing.
 
     `deadline` is a Budget: a `clock()` value past which the walk stops and
@@ -668,9 +1164,18 @@ def sweep(deadline=None, clock=time.monotonic, workers=None):
     mode, so a report describes the run a real one would perform.
     """
     data_dirs = load_data_dirs()
+    gate_cfg = load_gate_config()
     vis = repo_visibility() if ONLY_PUBLIC else {}
-    s = Sweep()
+    s = Sweep(record=record)
     workers = workers or DEFAULT_WORKERS
+
+    # Before anything is decided: has any gate merge been reverted? A pause
+    # found now must hold this very sweep's merges in that repo.
+    rows = s.rows()
+    pauses, s.unscanned = detect_reverts(rows)
+    for p in pauses:
+        rows.append(p)
+        _record(s, p)
 
     e = enumerate_open_prs(deadline=deadline, clock=clock, workers=workers)
     s.repos_total = len(e.repos)
@@ -685,7 +1190,7 @@ def sweep(deadline=None, clock=time.monotonic, workers=None):
                   and (not ONLY_PUBLIC
                        or vis.get(pr["repository"]["nameWithOwner"]) == "PUBLIC")]
 
-    cache = RepoCache()
+    cache = RepoCache(gate_cfg)
     stop = threading.Event()
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = [pool.submit(_read, pr, pr["repository"]["nameWithOwner"],
@@ -712,11 +1217,20 @@ def sweep(deadline=None, clock=time.monotonic, workers=None):
                 # No verdict was reached. Say exactly that, in its own
                 # section, rather than borrowing the wording of a decision.
                 s.failed.append((repo, num, str(exc), pr["title"]))
+                _record(s, ledger_row(Reading(pr, repo, num),
+                                      ledger.NO_VERDICT, str(exc)))
     return s
 
 
 def main():
     print(f"=== merge_gate :: {'REPORT ONLY' if DRY_RUN else 'APPLYING'} ===\n")
+    if not DRY_RUN:
+        try:
+            ledger.require_writable()
+        except ledger.LedgerError as exc:
+            print(f"⚠ {exc}\nRefusing to merge without a merge record. "
+                  f"Exit {EXIT_NO_LEDGER}.")
+            return EXIT_NO_LEDGER
     budget = os.environ.get("SWEEP_BUDGET_SECONDS", "").strip()
     deadline = (time.monotonic() + float(budget)) if budget else None
     s = sweep(deadline)
@@ -734,6 +1248,11 @@ def main():
     dump("STALE BASE (rebase requested)", s.stale)
     dump("ROUTED to review", s.review)
     dump("SKIPPED (deliberately ungated repo)", s.skipped)
+    # Not labelled on the PR: drift is a fact about the repo's settings, and
+    # every PR in it would carry the same label for the same reason.
+    dump("DRIFT (auto-merge on, no correctness gate — fix the repo)", s.drift)
+    dump("HELD by circuit breaker (green; repo paused, rate-limited or base red)",
+         s.held)
     if s.failed:
         dump("NO VERDICT — GitHub did not answer (retry; not a finding)", s.failed)
 
@@ -742,11 +1261,15 @@ def main():
             sh("pr", "edit", str(num), "--repo", repo, "--add-label", NEEDS_REVIEW)
 
     print(f"merged={len(s.armed)} stale={len(s.stale)} review={len(s.review)} "
-          f"skipped={len(s.skipped)} no_verdict={len(s.failed)}")
+          f"skipped={len(s.skipped)} drift={len(s.drift)} held={len(s.held)} "
+          f"no_verdict={len(s.failed)}")
     if s.failed:
         # Loud, because a partial sweep that looks complete is how a drained
         # queue gets reported while a fifth of it was never examined.
         print(f"⚠ {len(s.failed)} PR(s) got NO verdict. This run is incomplete.")
+    if s.ledger_errors:
+        print(f"⚠ {len(s.ledger_errors)} ledger write(s) failed: "
+              f"{s.ledger_errors[0]}")
     if s.repos_unlisted:
         # Not "no PRs there": GitHub did not answer for these repos, so
         # their PRs are simply absent from this walk (§22).

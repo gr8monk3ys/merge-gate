@@ -594,3 +594,58 @@ token is still GitHub not answering, and still raises.
 - **No branch protection on this repository.** It is single-author; the CI
   check is evidence, not a gate.
 - **The two policy constants stay strict** (see §9).
+
+## IX. Trust hardening (0.9.0)
+
+### 34. Green was looser than it read.
+
+Three readings of the check-runs endpoint counted as green when they were
+not. `skipped` passed unconditionally, so a required test job that skipped
+itself on a path filter cleared the gate having run nothing. A run with no
+conclusion yet was neither "missing" nor "failed", so a check still in
+progress fell through as green. And the endpoint pages at 30 and was read as
+one page, with duplicate names resolved last-listed-wins, so a re-run could
+be shadowed by the attempt before it. Now: every page; the newest run of a
+name; `skipped` only where the repo says so (`may_skip`), and the ledger
+records `green_by_skip` on any merge that rode on one.
+
+### 35. `allow_auto_merge` is an assertion, and it can drift.
+
+The gate trusted Phase 1's switch as proof that a real test gate existed. A
+repo whose only required check was a security scan could merge on it. At
+least one required check must now be a correctness gate, by the same
+predicate the control plane uses (re-implemented here, not imported: the
+control plane imports this package, so the import would run backwards).
+When none is, the verdict is DRIFT — reported on its own, because the fix is
+the repo's settings, not the PR.
+
+### 36. The gate had no memory.
+
+Whether a repo had already taken three gate merges today, which commit on a
+base was the gate's, and whether one had been reverted were questions nothing
+could answer, so nothing could refuse on them. The ledger is that memory —
+one JSONL file with one writer, not the control plane's committed per-run
+files, because a commit per sweep is the wrong cost for a record read every
+half hour. The breakers read it: a daily cap per repo, a hold while the base
+is red, and a pause on any revert of a gate merge that clears only when a
+human lists the revert's sha in `merge_gate_ack_reverts`. A pause that
+cleared on its own would let the gate put the reverted change's sibling
+straight back.
+
+### 37. `tests-only` was a claim about paths, and no denylist fixes that.
+
+Deleting a failing test, adding `@pytest.mark.skip`, focusing a suite with
+`.only` and loosening `conftest.py` all touch only test files, and each makes
+the required check greener while proving less. The first fix read the patch
+and matched skip idioms; review kept finding more (an aliased mark,
+`raise SkipTest`, `__test__ = False`, a duplicate name that shadows a test, an
+early `return` in a modified test). A denylist of ways to weaken a test is
+never complete, so the rule is now structural: tests-only auto-merges only
+when every file is NEW, is a test path, is not harness or config, and shares
+no name with anything already in the repo. Any change to an existing test
+goes to a human. The marker scan stays, as a second line on the new files.
+
+The diff is read from the compare API for exactly `base_sha...head_sha`,
+where `head_sha` is the single head read the merge is pinned to with
+`--match-head-commit`. `pulls/{n}/files` describes whatever the head is
+when it answers; a commit range cannot move under the reader.

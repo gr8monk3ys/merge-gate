@@ -504,6 +504,134 @@ def ci_fix_allowed(diff_text):
     )
 
 
+# ---------------------------------------------------------------------------
+# tests-only merges brand-new test files, and nothing else.
+#
+# Every path being a test file says nothing about what the diff does to the
+# tests. Deleting a failing test, marking it skipped, focusing a suite with
+# `.only`, an early `return` in a test body, a duplicate name that shadows a
+# test, `__test__ = False`, an aliased mark -- each makes the required check
+# greener while proving less, and a denylist of idioms can never be complete.
+# So the rule is structural: a tests-only PR auto-merges only when every file
+# is NEW (status `added`), is a test path, is not test harness or config, and
+# does not share a name with anything already in the repo. Any change to an
+# existing test routes to a human. The marker scan below is a second line of
+# defence on the new files, not the rule.
+# ---------------------------------------------------------------------------
+
+# Added lines matching any of these switch a test off (or switch every other
+# test off). Named, so the reason says which rule fired. Deliberately broad:
+# a false positive costs a review, a false negative costs a test.
+TEST_DISABLERS = [
+    # Any `.skip` / `.xfail` / `.only` / `.todo` attribute, called or not:
+    # pytest.mark.skip, mark.skip, an aliased `m.skip`, it.skip, describe.only.
+    (".skip/.xfail/.only/.todo attribute", r"\.(skip|skipif|xfail|only|todo)\b"),
+    ("pytestmark", r"\bpytestmark\b"),
+    ("__test__ =", r"\b__test__\s*="),
+    ("SkipTest", r"\bSkipTest\b"),
+    ("xfail", r"\bxfail\b"),
+    ("pytest.skip/importorskip", r"\bpytest\.(skip|importorskip)\b"),
+    ("unittest skip decorator", r"@(skip|skipIf|skipUnless|expectedFailure)\b"
+                                r"|\bunittest\.(skip|skipIf|skipUnless|expectedFailure)\b"
+                                r"|\bskipTest\b"),
+    ("import of a skip helper", r"\bimport\b.*\b(skip|skipif|skipIf|skipUnless|"
+                                r"expectedFailure|xfail|SkipTest|mark)\b"),
+    ("xit/xdescribe/fit/fdescribe", r"\b(x|f)(it|describe|test)\s*\("),
+    ("t.Skip(", r"\bt\.Skip(Now|f)?\s*\("),
+    ("#[ignore]", r"#\[ignore\]"),
+]
+
+# What a test RUN is configured by. A new file here changes what runs, not
+# just what is tested: conftest.py fixtures apply to every test below them.
+_HARNESS_DIRS = {"e2e", "playwright", "cypress"}
+_HARNESS_FILES = [
+    r"^conftest\.py$", r"^pytest\.ini$", r"^tox\.ini$", r"^setup\.cfg$",
+    r"^pyproject\.toml$", r"^\.coveragerc$",
+    r"^playwright\.config\.\w+$", r"^cypress\.config\.\w+$", r"^cypress\.json$",
+    r"^jest\.config\.\w+$", r"^jest\.setup\.\w+$", r"^vitest\.config\.\w+$",
+    r"^vitest\.workspace\.\w+$", r"^vitest\.setup\.\w+$", r"^setupTests\.\w+$",
+    r"^karma\.conf\.\w+$", r"^\.mocharc(\.\w+)?$",
+]
+
+_RE_PY_TEST_DEF = re.compile(r"^\s*(?:async\s+)?def\s+(test\w*)\s*\(")
+
+
+def is_test_harness(path):
+    """conftest.py, test-runner config, or anything in e2e/Playwright/Cypress."""
+    parts = (path or "").split("/")
+    base = parts[-1]
+    return (any(re.match(p, base) for p in _HARNESS_FILES)
+            or any(seg in _HARNESS_DIRS for seg in parts[:-1]))
+
+
+def tests_only_veto(files, existing_paths=()):
+    """Why a `tests-only` diff must not auto-merge, or None.
+
+    `files` is the compare API's file list for the exact commit range being
+    merged: dicts with filename, status, patch and (for renames)
+    previous_filename. `existing_paths` is every path in the base tree; None
+    means it could not be listed. Either being None vetoes: "I could not
+    check" never resolves to "there is nothing there". Reasons name the
+    file and the rule.
+    """
+    if files is None:
+        return "could not read the diff to check test content"
+    if not files:
+        return "the diff lists no files"
+    if existing_paths is None:
+        return "could not list the base tree to check new test names for collisions"
+
+    def key(p):
+        return p.rsplit("/", 1)[-1].lower()
+    existing = {}
+    for p in existing_paths:
+        existing.setdefault(key(p), p)
+    new_names = {}
+
+    for f in files:
+        name = f.get("filename") or ""
+        status = f.get("status") or ""
+        for p in (name, f.get("previous_filename")):
+            if p and is_test_harness(p):
+                return f"touches test harness/config: {p}"
+        if status != "added":
+            was = f.get("previous_filename")
+            return (f"{status or 'changed'} existing test file "
+                    f"{(was + ' -> ') if was else ''}{name}: only brand-new test "
+                    "files auto-merge")
+        if not is_test(name):
+            return f"{name} is not a test path"
+        # A new test module named like an existing file can shadow it (pytest
+        # rootdir-less imports, jest haste maps), and two new ones can shadow
+        # each other.
+        clash = existing.get(key(name)) or new_names.get(key(name))
+        if clash:
+            return f"new test file {name} shares its name with {clash}"
+        new_names[key(name)] = name
+        patch = f.get("patch")
+        if patch is None:
+            return f"no readable patch for {name} (binary or too large to judge)"
+        defs = {}
+        for line in patch.splitlines():
+            if line.startswith("-") and line[1:].strip():
+                # An `added` file has no removals; one that does is not new.
+                return f"{name} is listed as added but its patch removes lines"
+            if not line.startswith("+"):
+                continue
+            body = line[1:]
+            for label, pat in TEST_DISABLERS:
+                if re.search(pat, body):
+                    return (f"adds a test-disabling marker ({label}) in {name}: "
+                            f"{body.strip()[:80]}")
+            m = _RE_PY_TEST_DEF.match(body)
+            if m:
+                if m.group(1) in defs:
+                    return (f"defines {m.group(1)} twice in {name}; the second "
+                            "shadows the first")
+                defs[m.group(1)] = True
+    return None
+
+
 def gh_json(*args):
     r = _run_gh(["gh", *args])
     if r.returncode != 0:
@@ -577,6 +705,15 @@ def parse_repos_yml(path=None):
             # not say -- all_repos()'s fallback then guesses the first
             # configured owner, same as everywhere else that guess is made.
             "owner": body.get("owner"),
+            # Gate trust settings (see load_gate_config). Every one of these
+            # can only make the gate STRICTER or name a human decision; an
+            # absent field is the strict default.
+            "may_skip": list(body.get("may_skip") or []),
+            "correctness_checks": list(body.get("correctness_checks") or []),
+            "merge_gate_max_per_day": body.get("merge_gate_max_per_day"),
+            "merge_gate_paused": bool(body.get("merge_gate_paused", False)),
+            "merge_gate_ack_reverts": [str(s) for s in
+                                       body.get("merge_gate_ack_reverts") or []],
         }
     return out
 
@@ -593,6 +730,81 @@ def load_data_dirs():
                 if e["data_dir"]}
     except (OSError, SystemExit):
         return {}
+
+
+GATE_CONFIG_FIELDS = ("may_skip", "correctness_checks", "merge_gate_max_per_day",
+                      "merge_gate_paused", "merge_gate_ack_reverts")
+
+
+def load_gate_config():
+    """Per-repo gate trust settings, {bare repo name: {field: value}}.
+
+      may_skip                required check names that may pass as `skipped`
+                              (a path-filtered job). Absent: a skipped
+                              required check is NOT green.
+      correctness_checks      check names a human asserts ARE correctness
+                              gates when their names do not say so -- the same
+                              field the control plane's is_correctness_check
+                              reads.
+      merge_gate_max_per_day  overrides MERGE_GATE_MAX_PER_DAY for this repo.
+      merge_gate_paused       true: hold every gate merge in this repo.
+      merge_gate_ack_reverts  revert commit SHAs a human has looked at. A
+                              pause raised by a detected revert clears only
+                              when its SHA is listed here.
+
+    Forgiving in the same way as load_data_dirs and for the same reason: a
+    missing file or missing PyYAML yields {}, and every field's absent value
+    is the strict one, so degrading can never loosen the gate.
+    """
+    try:
+        entries = parse_repos_yml()
+    except (OSError, SystemExit):
+        return {}
+    return {k: {f: e[f] for f in GATE_CONFIG_FIELDS} for k, e in entries.items()}
+
+
+# ---------------------------------------------------------------------------
+# Which check names count as a gate on the code still working.
+#
+# Kept in step with the control plane's `_fleet.is_correctness_check` (same
+# lists, same `declared` override). It is re-implemented here rather than
+# imported because the import would run the wrong way: `_fleet` imports this
+# module at load time, sets GATE_OWNERS and exits if it is unhappy, and does
+# not exist at all where the package runs standalone. The control plane can
+# import this one instead and keep a single definition.
+# ---------------------------------------------------------------------------
+
+NOT_CORRECTNESS = [
+    r"ci-tests-minimum",
+    r"codeql", r"semgrep", r"trivy", r"gitleaks", r"trufflehog", r"osv",
+    r"snyk", r"bandit", r"sast", r"secret", r"security", r"audit",
+    r"license", r"dependabot", r"dependency.review",
+    r"deploy", r"vercel", r"netlify", r"preview", r"lighthouse",
+    r"analyze", r"codecov", r"coverage.upload", r"comment", r"label",
+    r"summary", r"notify", r"release", r"publish",
+]
+
+CORRECTNESS = [
+    r"\btest", r"\bspec\b", r"build", r"lint", r"typecheck", r"type.check",
+    r"tsc\b", r"compile", r"quality", r"\bci\b", r"ci-tests", r"e2e",
+    r"pytest", r"jest", r"vitest", r"unit", r"integration", r"precommit",
+    r"pre-commit", r"validate", r"check",
+]
+
+
+def is_correctness_check(name, declared=None):
+    """Is this check a gate on the code still working?
+
+    An explicit per-repo declaration (`correctness_checks`) wins over both
+    lists. Otherwise deny beats allow: "Dependency Review / build" contains a
+    correctness word and is still not a gate.
+    """
+    if declared and name in declared:
+        return True
+    n = (name or "").lower()
+    if any(re.search(p, n) for p in NOT_CORRECTNESS):
+        return False
+    return any(re.search(p, n) for p in CORRECTNESS)
 
 
 _TRANSIENT = ("connection reset", "read tcp", "timeout", "eof",

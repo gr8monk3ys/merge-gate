@@ -775,6 +775,16 @@ def selftest():
          {"check_runs": [{"name": "b", "conclusion": "success"}]},
          '[{"conclusion":"success","name":"b"}]\n'),
         ("[.check_runs[].name]", {"check_runs": [{"name": "x"}]}, '["x"]\n'),
+        # merge_gate.check_runs: every field the newest-run rule and the
+        # ledger need, with the app flattened to its slug.
+        ("[.check_runs[]|{id,name,status,conclusion,started_at,completed_at,"
+         "app:.app.slug}]",
+         {"check_runs": [{"id": 2, "name": "ci", "status": "completed",
+                          "conclusion": "success", "started_at": "a",
+                          "completed_at": "b",
+                          "app": {"slug": "github-actions"}}]},
+         '[{"app":"github-actions","completed_at":"b","conclusion":"success",'
+         '"id":2,"name":"ci","started_at":"a","status":"completed"}]\n'),
         ("[.workflow_runs[]|{name,conclusion,at:.updated_at}]",
          {"workflow_runs": [{"name": "CI", "conclusion": "failure",
                              "updated_at": "2026-08-30T00:00:00Z"}]},
@@ -904,6 +914,19 @@ def difftest():
           "--jq", ".[0].commit.committer.date"], True),
         (["gh", "api", f"repos/{repo}/commits/{branch}/check-runs",
           "--jq", "[.check_runs[]|{name,conclusion}]"], True),
+        # merge_gate.compare_files / base_tree_paths: the tests-only check
+        # reads an exact commit range and the base tree. Raw JSON, no jq.
+        (["gh", "api", f"repos/{repo}/compare/{branch}...{branch}"], True),
+        (["gh", "api", f"repos/{repo}/git/trees/{branch}?recursive=1"], True),
+        # merge_gate.branch_commits: revert detection. Raw pages, no jq.
+        (["gh", "api", f"repos/{repo}/commits?sha={branch}"
+                       "&since=2026-11-01T00:00:00Z&per_page=100", "--paginate"],
+         True),
+        # merge_gate.check_runs: paginated, one projected array per page.
+        (["gh", "api", f"repos/{repo}/commits/{branch}/check-runs?per_page=100",
+          "--paginate", "--jq",
+          "[.check_runs[]|{id,name,status,conclusion,started_at,"
+          "completed_at,app:.app.slug}]"], True),
         (["gh", "api", f"repos/{repo}/branches/{branch}/protection"
                        "/required_status_checks", "--jq", ".contexts"], True),
         # The base-freshness read (merge_gate.base_head). Its answer is
