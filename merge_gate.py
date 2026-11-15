@@ -1004,6 +1004,7 @@ def parse_verify_report(raw, repo, sha):
     """
     import io
     import zipfile
+    import zlib
     try:
         zf = zipfile.ZipFile(io.BytesIO(raw))
         infos = zf.infolist()
@@ -1013,7 +1014,11 @@ def parse_verify_report(raw, repo, sha):
         if infos[0].file_size > VERIFY_MAX_BYTES:
             return None, f"{VERIFY_FILE} is {infos[0].file_size} bytes"
         doc = json.loads(zf.read(infos[0]))
-    except (zipfile.BadZipFile, ValueError, OSError) as exc:
+    # Everything zipfile, zlib and json raise on bytes they cannot read:
+    # RuntimeError covers an encrypted entry, an unsupported method
+    # (NotImplementedError) and JSON nested too deep (RecursionError).
+    except (zipfile.BadZipFile, zlib.error, EOFError, RuntimeError,
+            ValueError, OSError) as exc:
         return None, f"unreadable artifact: {str(exc)[:60]}"
     if not isinstance(doc, dict):
         return None, "report is not an object"
