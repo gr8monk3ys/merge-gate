@@ -998,7 +998,8 @@ def parse_verify_report(raw, repo, sha):
     Strict: one file, schema 1, this repo, exactly this commit, at least one
     stage, unique stage names, non-negative int counts that add up, and --
     when a stage carries the optional `passed_ids` -- a sorted list of unique
-    non-empty strings, one per passed test. Anything else is no evidence,
+    non-empty strings, no more of them than passed tests (a test run twice,
+    say under two Playwright projects, is one ID). Anything else is no evidence,
     never partial evidence. `stages` is {name: counts (+ "passed_ids")}.
     """
     import io
@@ -1048,7 +1049,7 @@ def parse_verify_report(raw, repo, sha):
                 return None, f"stage {name}: passed_ids must be non-empty strings"
             if any(a >= b for a, b in itertools.pairwise(ids)):
                 return None, f"stage {name}: passed_ids not sorted and unique"
-            if len(ids) != counts["passed"]:
+            if len(ids) > counts["passed"]:
                 return None, (f"stage {name}: {len(ids)} passed_ids for "
                               f"{counts['passed']} passed")
             counts["passed_ids"] = ids

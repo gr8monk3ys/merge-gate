@@ -3,6 +3,15 @@
 Releases before 0.9.0 are described by their commit and PR messages;
 `DECISIONS.md` tells why each rule exists.
 
+## 0.10.3 — de-duplicated test IDs
+
+### Changed
+
+- **`passed_ids` may be fewer than passed tests.** A test that passes under
+  several runners (two Playwright projects, a parametrized case reported
+  once) is one ID. The list must still be sorted, unique and non-empty, and
+  more IDs than passed tests is still no evidence.
+
 ## 0.10.2 — no evidence downgrade
 
 ### Fixed
