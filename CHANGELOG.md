@@ -3,6 +3,16 @@
 Releases before 0.9.0 are described by their commit and PR messages;
 `DECISIONS.md` tells why each rule exists.
 
+## 0.12.1 — the CI-edit rule reads the range it merges
+
+### Security
+
+- **A PR on declared checks that edits anything under `.github/` routes.**
+  0.12.0 looked for `.github/workflows/` in the PR's path list, which is read
+  before the head and capped by the API. It now reads the compare of exactly
+  base...head (the range `--match-head-commit` merges), counts a rename out
+  of `.github/`, covers composite actions, and a truncated compare raises.
+
 ## 0.12.0 — the reviewed path reaches the PRs it missed
 
 The first real sweep with 0.11.0 found 2 reviewable PRs among 27.
