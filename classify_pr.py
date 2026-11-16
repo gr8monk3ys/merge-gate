@@ -770,6 +770,8 @@ def parse_repos_yml(path=None):
             # Only a literal `true` opts in; anything else is the strict default.
             "allow_tests_only": body.get("allow_tests_only") is True,
             "require_verify_evidence": body.get("require_verify_evidence") is True,
+            "allow_reviewed": body.get("allow_reviewed") is True,
+            "allow_reviewed_content": body.get("allow_reviewed_content") is True,
             # The one workflow whose runs may supply a verify-report, by path
             # (".github/workflows/ci.yml"). Absent: no evidence, ever.
             "verify_workflow": (body.get("verify_workflow")
@@ -796,7 +798,8 @@ def load_data_dirs():
 GATE_CONFIG_FIELDS = ("may_skip", "correctness_checks", "merge_gate_max_per_day",
                       "merge_gate_paused", "merge_gate_ack_reverts",
                       "allow_tests_only", "require_verify_evidence",
-                      "verify_workflow")
+                      "verify_workflow", "allow_reviewed",
+                      "allow_reviewed_content")
 
 
 def load_gate_config():
@@ -825,6 +828,13 @@ def load_gate_config():
                               successful push run of the base branch for a
                               base. Absent: no evidence, so both flags above
                               route everything they cover.
+      allow_reviewed          true: a PR whose shape is not on the allowlist
+                              may merge once a reviewer has posted a
+                              `merge-gate/review` commit status of `success`
+                              on the exact head the gate judges. Every other
+                              rule still applies. Absent: it routes to a human.
+      allow_reviewed_content  true: the same for a PR the content veto stops.
+                              Only read where allow_reviewed is also true.
       merge_gate_ack_reverts  revert commit SHAs a human has looked at. A
                               pause raised by a detected revert clears only
                               when its SHA is listed here.

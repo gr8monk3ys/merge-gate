@@ -3,6 +3,21 @@
 Releases before 0.9.0 are described by their commit and PR messages;
 `DECISIONS.md` tells why each rule exists.
 
+## 0.11.0 — the reviewed path
+
+### Added
+
+- **`allow_reviewed`: a reviewer's pass on the head can stand in for the
+  shape allowlist.** A PR in the gate's queue whose shape is `mixed`,
+  `content` or `empty` routed to a human, always. In a repo that sets
+  `allow_reviewed: true` it now merges when its required checks are green,
+  its base is fresh, no breaker holds it, and the newest `merge-gate/review`
+  commit status on the judged head is `success`. `allow_reviewed_content:
+  true` extends that to PRs the content veto stops. Both are literal-`true`
+  opt-ins; absent, nothing changes and no status is read. An unreadable diff
+  is never reviewable. The ledger row gains `review`. See README, *The
+  reviewed path*, and DECISIONS §40.
+
 ## 0.10.6 — a damaged artifact is refused, not raised
 
 ### Fixed

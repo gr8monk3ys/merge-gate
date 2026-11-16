@@ -45,11 +45,37 @@ below get a veto.)
 | `tests-only` | every file is a **brand-new** test file (status `added` in the compare of exactly the judged base...head), none is harness/config, none shares a name with an existing path, and none contains a skip/xfail/`.only`/`pytestmark`/`SkipTest`/`__test__` marker or a duplicate test name — **and** the repo opted in (`allow_tests_only`) **and** CI's test counts show more tests ran at head than at base (*Test-count evidence* below) | one source file alongside forty tests — there is no partial credit; **any change to an existing test file** (modified, removed, renamed, copied) routes to a human |
 | `data-artifact-only` | every path is inside a directory the repo has explicitly opted in via `data_dir` | anything, if the repo never opted in |
 | `ci-fix` | every added line matches an explicitly reviewed whitelist of action bumps | a workflow edit that merely *reads* like a fix |
-| `content` / `mixed` / `empty` / `unreadable` | — | always routed to a human |
+| `content` / `mixed` / `empty` | only on the reviewed path below | without the repo's opt-in, always routed to a human |
+| `unreadable` | — | always routed to a human |
 
 A **content veto** sits on top of all of it: if any changed path is editorial
 content, the PR does not auto-merge whatever its shape. And an *unreadable*
 diff vetoes — "I could not check" never resolves to "there is nothing there".
+
+## The reviewed path
+
+The allowlist answers "is this diff safe by its shape". A feature PR never
+is, so it waits for a person. A repo may name a second answer:
+`allow_reviewed: true` in `repos.yml`. Then a PR in the gate's queue whose
+shape is not on the allowlist merges when **all** of these hold:
+
+- everything a shaped PR needs: not a draft, auto-merge allowed, a required
+  correctness check, every required check green, a fresh base that is not
+  red, no breaker;
+- the newest `merge-gate/review` **commit status** on the exact head the
+  gate judged is `success`. A status belongs to a commit, so a push after the
+  review leaves the new head unreviewed, and `--match-head-commit` merges
+  that head or nothing.
+
+`allow_reviewed_content: true` extends it to PRs the content veto stops, and
+is read only where `allow_reviewed` is also true. An unreadable diff is never
+reviewable. The ledger row carries `review` (the state read) and its reason
+reads `mixed (reviewed); green: …`.
+
+The gate does not review; it reads a verdict. Who posts the status, and how
+hard they looked, is the operator's to arrange. Anyone with push access can
+post one, the PR's own author included, so this is a separation of runs, not
+of credentials.
 
 ## Circuit breakers
 
@@ -252,8 +278,8 @@ Optional: `repos.yml` (see `repos.example.yml`), looked for at
 reads `data_dir` (opt-in data paths), `may_skip` (required checks that may
 pass as skipped), `correctness_checks` (check names that are gates despite
 their names), `merge_gate_max_per_day`, `merge_gate_paused` and
-`merge_gate_ack_reverts`, `allow_tests_only`, `require_verify_evidence` and
-`verify_workflow`.
+`merge_gate_ack_reverts`, `allow_tests_only`, `require_verify_evidence`,
+`verify_workflow`, `allow_reviewed` and `allow_reviewed_content`.
 Every absent field is the strict value. The
 merge policy itself is constants at the top of `classify_pr.py`, and
 changing what merges is a one-line, deliberate edit.

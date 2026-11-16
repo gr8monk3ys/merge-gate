@@ -28,6 +28,12 @@ repos:
     # tests-only PRs may auto-merge -- only with a CI `verify-report`
     # artifact for head and base showing more tests ran (see README).
     allow_tests_only: false
+    # A PR whose shape is not on the allowlist may merge once a reviewer has
+    # posted a `merge-gate/review` commit status of `success` on its head.
+    # Every other rule still applies (required checks, base, breakers).
+    allow_reviewed: false
+    # The same for a PR the content veto stops. Needs allow_reviewed too.
+    allow_reviewed_content: false
     # Every merged shape needs a verify-report at head and base: no failed
     # test at head, no stage missing from it.
     require_verify_evidence: false

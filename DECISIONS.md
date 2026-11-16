@@ -726,3 +726,35 @@ malicious PR. A report produced outside the PR's reach (a `workflow_run`
 from the default branch re-running the tests, or an external runner) would
 close that; it was not built, and tests-only auto-merge stays opt-in per repo
 for exactly this reason.
+
+## XI. The reviewed path (0.11.0)
+
+### 40. The allowlist made the owner the merge step for everything that matters.
+
+The week of 2026-11-08 the fleet merged 119 PRs: 0 by the gate, 119 by a
+person. Shapes cover lockfiles, tests and safe bumps; a feature PR is `mixed`
+and routed, so every slice a producing loop finished waited for the one
+reviewer, and the open-PR cap then stopped the loops. The owner's decision
+(2026-11-15): a reviewer that is not them reads and the gate merges.
+
+So a repo may opt in (`allow_reviewed`), and then a passing review of the
+head stands in for the allowlist. Three things keep that from being "merge
+whatever a model liked":
+
+- **The review is bound to a commit.** It is a commit status, read for the
+  sha `read_state()` read and `--match-head-commit` names. A label or a
+  comment outlives a force-push; a status does not (the finance-owl#72
+  lesson, §29, applied to reviews).
+- **It adds a condition and removes one.** Required correctness checks, the
+  fresh-base rule, the red-base hold, the daily cap, the revert pause and the
+  per-repo pause all still apply. A red PR's review is never even read.
+- **Content is a second opt-in.** §3's veto stays the default inside an
+  opted-in repo; `allow_reviewed_content` is the owner saying a reviewer may
+  publish for them there.
+
+**What remains.** The reviewer and the author hold the same credential, so
+nothing stops a run from passing its own work; the separation is that the
+operator runs the review as a different job. And a review is a judgement, not
+a proof: the breakers and the post-merge survival record are what catch a
+wrong pass. A reviewer with its own token and a ruleset requiring its status
+would close the first; neither exists on a personal account.

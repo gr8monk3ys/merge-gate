@@ -218,6 +218,25 @@ def required_checks(repo, branch):
         raise ReadFailed(f"{repo}: unparseable required_status_checks")
 
 
+REVIEW_CONTEXT = "merge-gate/review"
+
+
+def review_state(repo, sha):
+    """The newest `merge-gate/review` commit status on exactly `sha`:
+    success | failure | error | pending, or None when none was posted.
+
+    GitHub lists a commit's statuses newest first, so a later failure
+    replaces an earlier pass. Raises ReadFailed: a review that could not be
+    read is not a review that was not posted.
+    """
+    out = sh_strict(
+        "api", f"repos/{repo}/commits/{sha}/statuses?per_page=100", "--jq",
+        f'[.[] | select(.context == "{REVIEW_CONTEXT}")][0].state // ""')
+    if out is None:
+        raise ReadFailed(f"{repo}@{sha[:8]}: commit not found")
+    return out.strip() or None
+
+
 def auto_merge_allowed(repo):
     """Does the repo permit auto-merge at all?
 
@@ -683,6 +702,10 @@ class Reading:
         # reason they do not license a merge (applied only to a green PR).
         self.evidence: dict | None = None
         self.evidence_why: str | None = None
+        # The reviewed path (allow_reviewed): this PR's shape is not on the
+        # allowlist, so it may merge only with a passing review of its head.
+        self.review_required = False
+        self.review: str | None = None     # the status state read, if any
 
 
 def _read(pr, repo, num, data_dirs, cache=None, stop=None):
@@ -724,6 +747,19 @@ def _read(pr, repo, num, data_dirs, cache=None, stop=None):
     bail_if(stop)
     # The same read carries the head and base the ledger records for PRs that
     # never reach read_state(): every row names the commit it was about.
+    # The reviewed path. A repo may say that a reviewer's pass on the head
+    # stands in for the shape allowlist (and, separately, for the content
+    # veto). Such a PR is then judged like any other: draft, ungated repo, red
+    # or missing checks, stale base, breakers. _decide() refuses the merge
+    # unless the review passed. An unreadable diff is never reviewable: "I
+    # could not see it" does not become "someone else looked".
+    cfg = cache.config(repo)
+    if (not r.mergeable and r.shape != "unreadable"
+            and cfg.get("allow_reviewed") is True
+            and (not content_veto(paths)
+                 or cfg.get("allow_reviewed_content") is True)):
+        r.review_required = r.mergeable = True
+
     out = sh_strict("api", f"repos/{repo}/pulls/{num}",
                     "--jq", ".auto_merge != null,.head.sha,.base.ref,.base.sha")
     lines = (out or "").splitlines()
@@ -733,6 +769,14 @@ def _read(pr, repo, num, data_dirs, cache=None, stop=None):
 
     if r.mergeable:
         r.state = read_state(repo, num, cache, stop)
+
+    # Read for exactly the head read_state() just read, the one
+    # --match-head-commit names, and only once the checks are green: a status
+    # belongs to a commit, so a push after the review leaves the new head
+    # with none.
+    if r.review_required and r.state.branch_head is not None:
+        bail_if(stop)
+        r.review = review_state(repo, r.state.sha)
 
     # tests-only is a claim about paths. What the diff does to the tests is a
     # claim about content, and no denylist of skip idioms is complete
@@ -1250,6 +1294,8 @@ def ledger_row(r, decision, reason, merge_commit_sha=None):
         "base_sha": st.base_sha if st else getattr(r, "base_sha", None),
         "checks": list(st.checks) if st else [],
         "green_by_skip": bool(st.green_by_skip) if st else False,
+        # The review status read at head_sha, on the reviewed path only.
+        "review": getattr(r, "review", None),
         "artifacts": artifacts,
         "decision": decision, "reason": reason,
         "dry_run": DRY_RUN,
@@ -1332,6 +1378,12 @@ def _decide(r, s):
             _file(s, "skipped", r, detail, ledger.SKIPPED)
         return
 
+    if green and r.review_required and r.review != "success":
+        _file(s, "review", r,
+              f"{r.why}; green, but {REVIEW_CONTEXT} is "
+              f"{r.review or 'not posted'} at {sha[:8]}", ledger.ROUTED)
+        return
+
     if green and r.evidence_why:
         # Green, but CI's own counts say a test failed, a stage vanished or
         # (tests-only) fewer tests ran: a human reads that, not the gate.
@@ -1386,7 +1438,8 @@ def _decide(r, s):
         if code != 0:
             _file(s, "skipped", r, f"merge refused: {err[:60]}", ledger.SKIPPED)
             return
-    _file(s, "armed", r, f"{r.shape}; {detail}",
+    _file(s, "armed", r,
+          f"{r.shape}{' (reviewed)' if r.review_required else ''}; {detail}",
           ledger.WOULD_MERGE if DRY_RUN else ledger.MERGED,
           None if DRY_RUN else _merge_commit_sha(repo, num))
     # This merge moved the base. Every candidate still to come on it was
