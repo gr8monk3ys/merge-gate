@@ -88,7 +88,8 @@ it as drift, permanently. Such a repo may list the check-run names in
 `repos.yml`; the gate then requires those on that base (one must still be a
 correctness check). Nothing but the gate enforces them, which holds where
 the gate is the only thing that merges. GitHub's own list wins where one
-exists. The ledger row carries `review` (the state read) and its reason
+exists. A PR that edits `.github/workflows/` never merges on declared
+checks: it could redefine them. The ledger row carries `review` (the state read) and its reason
 reads `mixed (reviewed); green: …`.
 
 The gate does not review; it reads a verdict. Who posts the status, and how
