@@ -173,7 +173,8 @@ def test_gate_config_is_read_from_repos_yml(tmp_path, monkeypatch):
                         "merge_gate_max_per_day": None,
                         "merge_gate_paused": False, "merge_gate_ack_reverts": [],
                         "allow_tests_only": False, "require_verify_evidence": False,
-                        "verify_workflow": None}
+                        "verify_workflow": None,
+                        "allow_reviewed": False, "allow_reviewed_content": False}
 
 
 def test_a_missing_repos_yml_yields_no_gate_config(tmp_path, monkeypatch):
