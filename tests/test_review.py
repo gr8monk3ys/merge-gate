@@ -250,3 +250,20 @@ def test_an_owners_pr_merges_on_a_review_never_on_its_shape(monkeypatch):
         mg._evaluate(_owner_pr(), "o/r", 7, {}, s, mg.RepoCache({"r": cfg}))
         assert len(_merges(writes)) == merged, review
     assert ledger.read()[0][-1]["source"] == "other"
+
+
+def test_declared_checks_cannot_vouch_for_a_pr_that_edits_the_workflows(monkeypatch):
+    # GitHub is not enforcing these checks, and this PR rewrites what produces them.
+    cfg = {"allow_reviewed": True, "gate_required_checks": ["ci"]}
+    for paths, merged in ((("src/x.py", ".github/workflows/ci.yml"), 0), (("src/x.py",), 1)):
+        writes = []
+        monkeypatch.setattr(mg, "sh_strict", _gh(_unprotected([_run("ci", "success")])
+                                                 + [(REVIEW, "success")]))
+        monkeypatch.setattr(mg, "changed_paths", lambda *a, p=paths: list(p))
+        monkeypatch.setattr(mg, "DRY_RUN", False)
+        monkeypatch.setattr(mg, "sh", lambda *a: writes.append(a) or (0, "", ""))
+        s = mg.Sweep()
+        mg._evaluate(_loop_pr(), "o/r", 7, {}, s, mg.RepoCache({"r": cfg}))
+        assert len(_merges(writes)) == merged, paths
+        if not merged:
+            assert "edits .github/workflows" in s.review[0][2]

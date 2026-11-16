@@ -423,6 +423,7 @@ class State:
         self.checks: list = []                    # [{name, conclusion, app}] per required
         self.branch_head: str | None = None       # where base was when read
         self.base_red: list = []                  # correctness checks red on base
+        self.registry_required = False            # required came from repos.yml
 
     @property
     def correctness(self):
@@ -510,6 +511,7 @@ def read_state(repo, number, cache=None, stop=None, cfg=None):
     # list wins wherever one exists.
     if not st.required:
         st.required = list(cfg.get("gate_required_checks") or [])
+        st.registry_required = bool(st.required)
     if not st.required or not st.correctness:
         return st
 
@@ -1412,6 +1414,15 @@ def _decide(r, s):
             _file(s, "drift", r, detail, ledger.DRIFT)
         else:
             _file(s, "skipped", r, detail, ledger.SKIPPED)
+        return
+
+    if green and st.registry_required and any(
+            p.startswith(".github/workflows/") for p in r.paths or ()):
+        # The declared checks are enforced by nothing but this gate, and
+        # this PR rewrites the workflows that report them.
+        _file(s, "review", r, "green on checks this PR can redefine: it edits "
+              ".github/workflows and the required checks are declared, not "
+              "GitHub's", ledger.ROUTED)
         return
 
     if green and r.review_required and r.review != "success":
