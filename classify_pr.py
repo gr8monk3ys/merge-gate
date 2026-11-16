@@ -770,6 +770,7 @@ def parse_repos_yml(path=None):
             # Only a literal `true` opts in; anything else is the strict default.
             "allow_tests_only": body.get("allow_tests_only") is True,
             "require_verify_evidence": body.get("require_verify_evidence") is True,
+            "gate_required_checks": list(body.get("gate_required_checks") or []),
             "allow_reviewed": body.get("allow_reviewed") is True,
             "allow_reviewed_content": body.get("allow_reviewed_content") is True,
             # The one workflow whose runs may supply a verify-report, by path
@@ -799,7 +800,7 @@ GATE_CONFIG_FIELDS = ("may_skip", "correctness_checks", "merge_gate_max_per_day"
                       "merge_gate_paused", "merge_gate_ack_reverts",
                       "allow_tests_only", "require_verify_evidence",
                       "verify_workflow", "allow_reviewed",
-                      "allow_reviewed_content")
+                      "allow_reviewed_content", "gate_required_checks")
 
 
 def load_gate_config():
@@ -828,6 +829,11 @@ def load_gate_config():
                               successful push run of the base branch for a
                               base. Absent: no evidence, so both flags above
                               route everything they cover.
+      gate_required_checks    check-run names the gate requires on a base
+                              GitHub reports no required checks for (a private
+                              repo on a free plan cannot have any). One still
+                              has to be a correctness check. GitHub's own list
+                              wins where it exists.
       allow_reviewed          true: a PR whose shape is not on the allowlist
                               may merge once a reviewer has posted a
                               `merge-gate/review` commit status of `success`

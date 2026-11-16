@@ -127,3 +127,126 @@ def test_the_breakers_still_hold_a_reviewed_pr(monkeypatch):
     s, writes = _evaluate(monkeypatch, {"allow_reviewed": True,
                                         "merge_gate_paused": True})
     assert _merges(writes) == [] and len(s.held) == 1
+
+
+# --- a tests-only PR the shape rules decline is reviewable like any other ---
+
+from test_trust import _new, _real, _tests_only, WF  # noqa: E402
+
+
+def _with_review(monkeypatch, state):
+    """Serve `state` as the review on head hA, on top of what is patched."""
+    inner = mg.sh_strict
+    monkeypatch.setattr(mg, "sh_strict", lambda *a: state if
+                        "commits/hA/statuses" in " ".join(a) else inner(*a))
+
+
+def test_a_tests_only_pr_in_a_repo_without_that_opt_in_takes_the_reviewed_path(monkeypatch):
+    pr, _ = _tests_only(monkeypatch, [_new("tests/test_p.py")])
+    _with_review(monkeypatch, "success")
+    writes = _real(monkeypatch)
+    s = mg.Sweep()
+    mg._evaluate(pr, "o/r", 9, {}, s, mg.RepoCache({"r": {"allow_reviewed": True}}))
+    assert len(_merges(writes)) == 1
+    assert s.armed[0][2].startswith("tests-only (reviewed); green")
+
+
+def test_a_tests_only_pr_the_veto_rejects_takes_the_reviewed_path(monkeypatch):
+    # An edit to an existing test file: never mergeable by shape, whatever CI counts.
+    changed = {"filename": "tests/test_old.py", "status": "modified", "patch": "@@\n+x\n"}
+    pr, _ = _tests_only(monkeypatch, [changed])
+    _with_review(monkeypatch, "success")
+    writes = _real(monkeypatch)
+    cfg = {"allow_tests_only": True, "verify_workflow": WF, "allow_reviewed": True}
+    s = mg.Sweep()
+    mg._evaluate(pr, "o/r", 9, {}, s, mg.RepoCache({"r": cfg}))
+    assert len(_merges(writes)) == 1
+
+
+def test_a_declined_tests_only_pr_without_a_review_keeps_its_reason(monkeypatch):
+    pr, _ = _tests_only(monkeypatch, [_new("tests/test_p.py")])
+    _with_review(monkeypatch, "")
+    writes = _real(monkeypatch)
+    s = mg.Sweep()
+    mg._evaluate(pr, "o/r", 9, {}, s, mg.RepoCache({"r": {"allow_reviewed": True}}))
+    assert _merges(writes) == []
+    assert s.review[0][2].startswith("tests-only auto-merge is off for this repo")
+    assert s.review[0][2].endswith(f"green, but {mg.REVIEW_CONTEXT} is not posted at hA")
+
+
+# --- required checks a repo declares, where GitHub cannot hold any ----------
+
+def _unprotected(runs):
+    """PR #7 on a base with no branch protection (a private repo, free plan)."""
+    return _repo([], runs)
+
+
+def test_declared_checks_gate_a_repo_github_cannot_protect(monkeypatch):
+    monkeypatch.setattr(mg, "sh_strict", _gh(_unprotected([_run("ci", "success")])))
+    cache = mg.RepoCache({"r": {"gate_required_checks": ["ci"]}})
+    green, why = mg.judge(mg.read_state("o/r", 7, cache))
+    assert green is True and why == "green: ci"
+
+
+def test_a_declared_check_that_did_not_run_blocks(monkeypatch):
+    monkeypatch.setattr(mg, "sh_strict", _gh(_unprotected([_run("lint", "success")])))
+    cache = mg.RepoCache({"r": {"gate_required_checks": ["ci"]}})
+    assert mg.judge(mg.read_state("o/r", 7, cache)) == (
+        False, "required check(s) not run: ci")
+
+
+def test_without_a_declaration_an_unprotected_repo_is_still_drift(monkeypatch):
+    monkeypatch.setattr(mg, "sh_strict", _gh(_unprotected([_run("ci", "success")])))
+    green, why = mg.judge(mg.read_state("o/r", 7, mg.RepoCache({"r": {}})))
+    assert green is None and why.startswith(mg.DRIFT)
+
+
+def test_githubs_own_required_checks_win_over_the_declaration(monkeypatch):
+    monkeypatch.setattr(mg, "sh_strict", _gh(_repo(["build"], [_run("ci", "success")])))
+    cache = mg.RepoCache({"r": {"gate_required_checks": ["ci"]}})
+    assert mg.judge(mg.read_state("o/r", 7, cache)) == (
+        False, "required check(s) not run: build")
+
+
+def test_declared_checks_parse_as_a_list_of_names(tmp_path, monkeypatch):
+    pytest.importorskip("yaml")
+    y = tmp_path / "repos.yml"
+    y.write_text("repos:\n  a: { gate_required_checks: [ci, 'Lint, Test & Build'] }\n  b: {}\n")
+    monkeypatch.setenv("GATE_REPOS_YML", str(y))
+    cfg = cp.load_gate_config()
+    assert cfg["a"]["gate_required_checks"] == ["ci", "Lint, Test & Build"]
+    assert cfg["b"]["gate_required_checks"] == []
+
+
+# --- a PR an owner opened is in the queue of a repo that opted in ------------
+
+def _owner_pr(login="me", num=7, draft=False):
+    return {"number": num, "title": "feat: mine", "body": "", "isDraft": draft,
+            "author": {"login": login}, "labels": [], "headRefName": "feat/mine",
+            "repository": {"nameWithOwner": "o/r"}}
+
+
+def test_an_owners_pr_joins_the_queue_only_where_the_repo_opted_in(monkeypatch):
+    monkeypatch.setattr(cp, "OWNERS", ["Me", "my-org"])
+    opted, plain = {"r": {"allow_reviewed": True}}, {"r": {}}
+    assert mg.in_queue(_owner_pr(), opted) is True          # login match ignores case
+    assert mg.in_queue(_owner_pr(), plain) is False
+    assert mg.in_queue(_owner_pr("a-stranger"), opted) is False
+    loop = dict(_loop_pr(), repository={"nameWithOwner": "o/r"})
+    assert mg.in_queue(loop, plain) is True                 # the fleet's own output, as before
+
+
+def test_an_owners_pr_merges_on_a_review_never_on_its_shape(monkeypatch):
+    # A lockfile-only diff: a loop's would merge on shape alone.
+    cfg = {"allow_reviewed": True}
+    answers = _repo(["ci"], [_run("ci", "success")])
+    for review, merged in (("", 0), ("success", 1)):
+        writes = []
+        monkeypatch.setattr(mg, "sh_strict", _gh(answers + [(REVIEW, review)]))
+        monkeypatch.setattr(mg, "changed_paths", lambda *a: ["uv.lock"])
+        monkeypatch.setattr(mg, "DRY_RUN", False)
+        monkeypatch.setattr(mg, "sh", lambda *a: writes.append(a) or (0, "", ""))
+        s = mg.Sweep()
+        mg._evaluate(_owner_pr(), "o/r", 7, {}, s, mg.RepoCache({"r": cfg}))
+        assert len(_merges(writes)) == merged, review
+    assert ledger.read()[0][-1]["source"] == "other"

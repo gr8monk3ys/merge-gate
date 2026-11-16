@@ -69,7 +69,26 @@ shape is not on the allowlist merges when **all** of these hold:
 
 `allow_reviewed_content: true` extends it to PRs the content veto stops, and
 is read only where `allow_reviewed` is also true. An unreadable diff is never
-reviewable. The ledger row carries `review` (the state read) and its reason
+reviewable.
+
+Two more kinds of PR take this path in an opted-in repo:
+
+- a `tests-only` PR the shape rules turned away (no `allow_tests_only`, or it
+  edits an existing test file). It merges on the review, so it does not owe
+  the shape's test-count evidence;
+- a PR **an owner opened** (author login in `GATE_OWNERS`). Without the
+  opt-in a person's PR is never in the queue. With it, a ready PR of theirs
+  is judged like the fleet's output, except that no shape merges it: only a
+  review does. A draft is still skipped, so a draft is how its author holds
+  one back. A PR from anyone else is never in the queue.
+
+**`gate_required_checks`.** A private repo on a free plan cannot have branch
+protection, so GitHub reports no required checks for it and the gate filed
+it as drift, permanently. Such a repo may list the check-run names in
+`repos.yml`; the gate then requires those on that base (one must still be a
+correctness check). Nothing but the gate enforces them, which holds where
+the gate is the only thing that merges. GitHub's own list wins where one
+exists. The ledger row carries `review` (the state read) and its reason
 reads `mixed (reviewed); green: …`.
 
 The gate does not review; it reads a verdict. Who posts the status, and how
@@ -279,7 +298,8 @@ reads `data_dir` (opt-in data paths), `may_skip` (required checks that may
 pass as skipped), `correctness_checks` (check names that are gates despite
 their names), `merge_gate_max_per_day`, `merge_gate_paused` and
 `merge_gate_ack_reverts`, `allow_tests_only`, `require_verify_evidence`,
-`verify_workflow`, `allow_reviewed` and `allow_reviewed_content`.
+`verify_workflow`, `allow_reviewed`, `allow_reviewed_content` and
+`gate_required_checks`.
 Every absent field is the strict value. The
 merge policy itself is constants at the top of `classify_pr.py`, and
 changing what merges is a one-line, deliberate edit.

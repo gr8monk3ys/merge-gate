@@ -3,6 +3,27 @@
 Releases before 0.9.0 are described by their commit and PR messages;
 `DECISIONS.md` tells why each rule exists.
 
+## 0.12.0 — the reviewed path reaches the PRs it missed
+
+The first real sweep with 0.11.0 found 2 reviewable PRs among 27.
+
+### Added
+
+- **An owner's own PR is in the queue of a repo with `allow_reviewed`.** A
+  ready PR whose author is in `GATE_OWNERS` is judged like the fleet's
+  output, and merges only on a review, never on its shape. Drafts are still
+  skipped; other authors are never in the queue (`in_queue`).
+- **`gate_required_checks`.** Check-run names the gate requires on a base
+  GitHub reports no required checks for. A private repo on a free plan
+  cannot have branch protection (§33), so every PR there was drift forever.
+
+### Fixed
+
+- **A `tests-only` PR the shape rules decline now falls back to the reviewed
+  path.** 0.11.0 decided reviewability before the tests-only opt-in and veto
+  ran, so those PRs routed to a human even in an opted-in repo. A reviewed
+  tests-only PR does not owe the shape's test-count evidence.
+
 ## 0.11.0 — the reviewed path
 
 ### Added
