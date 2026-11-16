@@ -758,3 +758,28 @@ operator runs the review as a different job. And a review is a judgement, not
 a proof: the breakers and the post-merge survival record are what catch a
 wrong pass. A reviewer with its own token and a ruleset requiring its status
 would close the first; neither exists on a personal account.
+
+### 41. Reviewability is decided last, and a person's PR is reviewable too (0.12.0).
+
+0.11.0's first sweep listed 2 PRs for review out of 27. Nine were tests-only
+PRs that the opt-in or the veto (§37) had turned away: reviewability was
+computed from the shape before those rules ran, so a declined tests-only PR
+was neither mergeable by shape nor reviewable. It is now the last thing
+decided: whatever the shape rules declined, a review can stand in for.
+
+The owner then asked for the same path for PRs they open themselves. Until
+now a person's PR was never in the queue, which was right while the only way
+to merge was a shape: a human's work in progress must not land because it
+happened to touch only a lockfile. On the reviewed path that objection goes.
+So in an opted-in repo an owner's ready PR is in the queue, no shape merges
+it, and a review does. Draft means "not yet", as it always did.
+
+### 42. Where GitHub cannot hold required checks, the registry may (0.12.0).
+
+§33 made the gate read a free plan's 403 as a real answer: this private repo
+has no branch protection. True, and it meant every such repo was drift or
+ungated forever, whatever CI it ran. `gate_required_checks` lets the registry
+name the check-runs instead. GitHub does not enforce them; the gate grades
+them at the head exactly as it grades GitHub's own list, and the gate is the
+only thing that merges. A name that never reports is `missing` and blocks,
+so a wrong declaration fails closed.

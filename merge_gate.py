@@ -60,6 +60,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import gate_ledger as ledger  # noqa: E402
+import classify_pr  # noqa: E402
 import gh_transport  # noqa: E402
 from classify_pr import (  # noqa: E402
     DEFAULT_WORKERS, Abandoned, _run_gh, auto_mergeable, bail_if, bump_kind,
@@ -199,6 +200,24 @@ def is_loop_produced(repo, number, pr):
         code, out, _ = sh("api", f"repos/{repo}/pulls/{number}", "--jq", ".head.ref")
         head = out if code == 0 else ""
     return head.startswith("auto/")
+
+
+def in_queue(pr, gate_cfg):
+    """Is this PR the gate's to judge?
+
+    The fleet's own output always is. In a repo with `allow_reviewed`, so is
+    a PR one of the gate's owners opened: the owner asked that a reviewer,
+    not they, be the merge step for their own work too. It merges only on
+    the reviewed path (_read), and a draft is still a draft, so keeping a PR
+    a draft is how its author holds it back. A stranger's PR is never here.
+    """
+    repo = pr["repository"]["nameWithOwner"]
+    if is_loop_produced(repo, pr["number"], pr):
+        return True
+    cfg = gate_cfg.get(repo.split("/")[-1]) or {}
+    login = ((pr.get("author") or {}).get("login") or "").lower()
+    return (cfg.get("allow_reviewed") is True
+            and login in {o.lower() for o in classify_pr.OWNERS})
 
 
 def required_checks(repo, branch):
@@ -484,6 +503,13 @@ def read_state(repo, number, cache=None, stop=None, cfg=None):
     bail_if(stop)
     st.required = cache.get(("required_checks", repo, base),
                             lambda: required_checks(repo, base))
+    # A private repo on a free plan cannot have branch protection (§33), so
+    # GitHub holds no list for it and never will. The registry may declare
+    # the checks instead; nothing but this gate enforces them, which is
+    # enough where this gate is the only thing that merges. GitHub's own
+    # list wins wherever one exists.
+    if not st.required:
+        st.required = list(cfg.get("gate_required_checks") or [])
     if not st.required or not st.correctness:
         return st
 
@@ -725,8 +751,12 @@ def _read(pr, repo, num, data_dirs, cache=None, stop=None):
     r.shape = promote_candidate(
         classify(paths, data_dirs.get(repo.split("/")[1])), title, body)
     r.mergeable = auto_mergeable(r.shape, paths)
-
-    if not r.mergeable:
+    if r.mergeable and r.source == "other":
+        # Not the fleet's output (in_queue): a person's PR, which a shape
+        # alone never merges. Someone has to have read it.
+        r.mergeable = False
+        r.why = "opened by an owner: merges only on a review"
+    elif not r.mergeable:
         if r.shape == "unreadable":
             # Distinguish "I could not read this diff" from a real veto.
             # Reporting an API failure as "content veto" sends someone
@@ -747,19 +777,6 @@ def _read(pr, repo, num, data_dirs, cache=None, stop=None):
     bail_if(stop)
     # The same read carries the head and base the ledger records for PRs that
     # never reach read_state(): every row names the commit it was about.
-    # The reviewed path. A repo may say that a reviewer's pass on the head
-    # stands in for the shape allowlist (and, separately, for the content
-    # veto). Such a PR is then judged like any other: draft, ungated repo, red
-    # or missing checks, stale base, breakers. _decide() refuses the merge
-    # unless the review passed. An unreadable diff is never reviewable: "I
-    # could not see it" does not become "someone else looked".
-    cfg = cache.config(repo)
-    if (not r.mergeable and r.shape != "unreadable"
-            and cfg.get("allow_reviewed") is True
-            and (not content_veto(paths)
-                 or cfg.get("allow_reviewed_content") is True)):
-        r.review_required = r.mergeable = True
-
     out = sh_strict("api", f"repos/{repo}/pulls/{num}",
                     "--jq", ".auto_merge != null,.head.sha,.base.ref,.base.sha")
     lines = (out or "").splitlines()
@@ -769,14 +786,6 @@ def _read(pr, repo, num, data_dirs, cache=None, stop=None):
 
     if r.mergeable:
         r.state = read_state(repo, num, cache, stop)
-
-    # Read for exactly the head read_state() just read, the one
-    # --match-head-commit names, and only once the checks are green: a status
-    # belongs to a commit, so a push after the review leaves the new head
-    # with none.
-    if r.review_required and r.state.branch_head is not None:
-        bail_if(stop)
-        r.review = review_state(repo, r.state.sha)
 
     # tests-only is a claim about paths. What the diff does to the tests is a
     # claim about content, and no denylist of skip idioms is complete
@@ -814,11 +823,38 @@ def _read(pr, repo, num, data_dirs, cache=None, stop=None):
             r.mergeable = False
             r.why = f"tests-only rejected: {veto}"
         new_tests = count_new_tests(files)
+
+    # The reviewed path. A repo may say that a reviewer's pass on the head
+    # stands in for whatever the shape rules above declined: a shape off the
+    # allowlist, a tests-only PR the opt-in or the veto turned away and,
+    # separately, the content veto. Such a PR is then judged like any other
+    # (draft, ungated repo, red or missing checks, stale base, breakers), and
+    # _decide() refuses the merge unless the review passed. An unreadable
+    # diff is never reviewable: "I could not see it" does not become "someone
+    # else looked".
+    cfg = cache.config(repo)
+    if (not r.mergeable and r.shape != "unreadable"
+            and cfg.get("allow_reviewed") is True
+            and (not content_veto(paths)
+                 or cfg.get("allow_reviewed_content") is True)):
+        r.review_required = r.mergeable = True
+        if r.state is None:
+            r.state = read_state(repo, num, cache, stop)
+        # Read for exactly the head read_state() read, the one
+        # --match-head-commit names, and only once the checks are green: a
+        # status belongs to a commit, so a push after the review leaves the
+        # new head with none.
+        if r.state.branch_head is not None:
+            bail_if(stop)
+            r.review = review_state(repo, r.state.sha)
+
     # Test counts from CI: required for tests-only, and for every shape in a
     # repo that sets require_verify_evidence. Read only once the checks are
     # green (branch_head is read only then): before that there is no finished
     # run to read, and judge() already has the finding.
-    full = r.shape == "tests-only"
+    # A reviewed tests-only PR is not merging on its shape, so it does not owe
+    # the shape's evidence.
+    full = r.shape == "tests-only" and not r.review_required
     if (r.mergeable and r.state.branch_head is not None
             and (full or cache.config(repo).get("require_verify_evidence") is True)):
         bail_if(stop)
@@ -1523,8 +1559,7 @@ def sweep(deadline=None, clock=time.monotonic, workers=None, record=True):
         s.stopped_early = True
 
     considered = [pr for pr in e.prs
-                  if is_loop_produced(pr["repository"]["nameWithOwner"],
-                                      pr["number"], pr)
+                  if in_queue(pr, gate_cfg)
                   and (not ONLY_PUBLIC
                        or vis.get(pr["repository"]["nameWithOwner"]) == "PUBLIC")]
 

@@ -34,6 +34,9 @@ repos:
     allow_reviewed: false
     # The same for a PR the content veto stops. Needs allow_reviewed too.
     allow_reviewed_content: false
+    # Check-run names the gate requires where GitHub reports no required
+    # checks (a private repo on a free plan cannot have branch protection).
+    gate_required_checks: []
     # Every merged shape needs a verify-report at head and base: no failed
     # test at head, no stage missing from it.
     require_verify_evidence: false
