@@ -733,6 +733,7 @@ class Reading:
         # The reviewed path (allow_reviewed): this PR's shape is not on the
         # allowlist, so it may merge only with a passing review of its head.
         self.review_required = False
+        self.edits_ci = False              # see _read: declared checks only
         self.review: str | None = None     # the status state read, if any
 
 
@@ -849,6 +850,19 @@ def _read(pr, repo, num, data_dirs, cache=None, stop=None):
         if r.state.branch_head is not None:
             bail_if(stop)
             r.review = review_state(repo, r.state.sha)
+
+    # Where the required checks are only declared (gate_required_checks),
+    # GitHub enforces nothing, so a PR that edits CI could redefine what it is
+    # judged by. Read from the compare of exactly base...head, the range
+    # --match-head-commit merges: the PR's path list was read before the head
+    # and can describe an earlier push. A truncated compare raises.
+    if (r.mergeable and r.state.registry_required
+            and r.state.branch_head is not None):
+        bail_if(stop)
+        r.edits_ci = any(
+            (f.get(k) or "").startswith(".github/")
+            for f in compare_files(repo, r.state.base_sha, r.state.sha)
+            for k in ("filename", "previous_filename"))
 
     # Test counts from CI: required for tests-only, and for every shape in a
     # repo that sets require_verify_evidence. Read only once the checks are
@@ -1416,13 +1430,10 @@ def _decide(r, s):
             _file(s, "skipped", r, detail, ledger.SKIPPED)
         return
 
-    if green and st.registry_required and any(
-            p.startswith(".github/workflows/") for p in r.paths or ()):
-        # The declared checks are enforced by nothing but this gate, and
-        # this PR rewrites the workflows that report them.
+    if green and r.edits_ci:
         _file(s, "review", r, "green on checks this PR can redefine: it edits "
-              ".github/workflows and the required checks are declared, not "
-              "GitHub's", ledger.ROUTED)
+              ".github/ and the required checks are declared, not GitHub's",
+              ledger.ROUTED)
         return
 
     if green and r.review_required and r.review != "success":

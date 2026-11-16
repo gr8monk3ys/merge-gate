@@ -254,16 +254,24 @@ def test_an_owners_pr_merges_on_a_review_never_on_its_shape(monkeypatch):
 
 def test_declared_checks_cannot_vouch_for_a_pr_that_edits_the_workflows(monkeypatch):
     # GitHub is not enforcing these checks, and this PR rewrites what produces them.
+    # Judged from the compare of the exact range merged, not the PR's path
+    # list: here the list never mentions the CI file the range contains.
+    import json
     cfg = {"allow_reviewed": True, "gate_required_checks": ["ci"]}
-    for paths, merged in ((("src/x.py", ".github/workflows/ci.yml"), 0), (("src/x.py",), 1)):
+    renamed = {"filename": "ci/x.yml", "previous_filename": ".github/workflows/ci.yml"}
+    for files, merged in (([{"filename": "src/x.py"}, {"filename": ".github/actions/a/action.yml"}], 0),
+                          ([{"filename": "src/x.py"}, renamed], 0),
+                          ([{"filename": "src/x.py"}], 1)):
+        paths = ("src/x.py",)
         writes = []
-        monkeypatch.setattr(mg, "sh_strict", _gh(_unprotected([_run("ci", "success")])
-                                                 + [(REVIEW, "success")]))
+        monkeypatch.setattr(mg, "sh_strict", _gh(
+            [("compare/base0...h7", json.dumps({"files": files}))]
+            + _unprotected([_run("ci", "success")]) + [(REVIEW, "success")]))
         monkeypatch.setattr(mg, "changed_paths", lambda *a, p=paths: list(p))
         monkeypatch.setattr(mg, "DRY_RUN", False)
         monkeypatch.setattr(mg, "sh", lambda *a: writes.append(a) or (0, "", ""))
         s = mg.Sweep()
         mg._evaluate(_loop_pr(), "o/r", 7, {}, s, mg.RepoCache({"r": cfg}))
-        assert len(_merges(writes)) == merged, paths
+        assert len(_merges(writes)) == merged, files
         if not merged:
-            assert "edits .github/workflows" in s.review[0][2]
+            assert "it edits .github/" in s.review[0][2]
