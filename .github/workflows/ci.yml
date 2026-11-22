@@ -23,6 +23,7 @@ jobs:
       - run: python -m pip install --quiet ".[dev]"
       # Pure functions only. Nothing here touches the network or `gh`; the
       # live fixtures (`classify_pr.py --validate`) belong to the operator.
+      - run: ruff check .
       - run: python -m pytest -q
       - run: python classify_pr.py --validate
 

@@ -331,7 +331,7 @@ def render(values):
             lines.append(str(v))
         else:
             lines.append(json.dumps(v, separators=(",", ":"), sort_keys=True))
-    return "".join(l + "\n" for l in lines)
+    return "".join(ln + "\n" for ln in lines)
 
 
 # --------------------------------------------------------------------------
@@ -449,7 +449,7 @@ _PR_FIELDS = {
     "createdAt": lambda p: p.get("created_at"),
     "isDraft": lambda p: p.get("draft", False),
     "headRefName": lambda p: (p.get("head") or {}).get("ref"),
-    "labels": lambda p: [{"name": l["name"]} for l in p.get("labels") or []],
+    "labels": lambda p: [{"name": lb["name"]} for lb in p.get("labels") or []],
     "author": lambda p: {"login": _login(p)},
 }
 

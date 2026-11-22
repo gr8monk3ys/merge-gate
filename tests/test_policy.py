@@ -6,10 +6,13 @@ not have, or was blocked when it should not have been -- DECISIONS.md tells
 those stories. The live fixtures (`classify_pr.py --validate`) belong to
 whoever operates the gate.
 """
+import datetime as dt
 import importlib
+import json
 
 import pytest
 
+import ci_watchdog as cw
 import classify_pr as cp
 import merge_gate as mg
 from classify_pr import bump_kind as mg_bump_kind
@@ -1087,10 +1090,6 @@ def test_writes_happen_on_the_calling_thread_never_in_a_reader(monkeypatch):
 # fleet look unwatched and healthy for identical reasons. It timed out daily
 # for two days that way.
 
-import datetime as dt
-import json
-
-import ci_watchdog as cw
 
 
 def _stub_scan(monkeypatch, verdicts):
