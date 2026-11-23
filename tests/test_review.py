@@ -10,7 +10,7 @@ import gate_ledger as ledger
 import merge_gate as mg
 from test_trust import _gh, _merges, _repo, _run
 
-REVIEW = f"commits/h7/statuses"
+REVIEW = "commits/h7/statuses"
 
 
 def _loop_pr(num=7):

@@ -63,7 +63,7 @@ import gate_ledger as ledger  # noqa: E402
 import classify_pr  # noqa: E402
 import gh_transport  # noqa: E402
 from classify_pr import (  # noqa: E402
-    DEFAULT_WORKERS, Abandoned, _run_gh, auto_mergeable, bail_if, bump_kind,
+    DEFAULT_WORKERS, _run_gh, auto_mergeable, bail_if, bump_kind,
     changed_paths, classify, conflict_self_heals, content_veto, count_new_tests,
     enumerate_open_prs, is_conflict, is_correctness_check, is_dependabot,
     load_data_dirs, load_gate_config, promote_candidate, repo_visibility,
@@ -177,7 +177,7 @@ def is_loop_produced(repo, number, pr):
     the reliable marker, so accept either. Human-opened PRs match neither and
     are never auto-merged.
     """
-    if "automated" in [l["name"] for l in pr.get("labels", [])]:
+    if "automated" in [lb["name"] for lb in pr.get("labels", [])]:
         return True
 
     # Dependabot is machine output too, and it was 209 of the 268 actionable
@@ -1319,7 +1319,7 @@ def pr_source(pr):
     the gate's own eligibility rule is is_loop_produced()."""
     if is_dependabot(pr):
         return "dependabot"
-    labels = [l.get("name") for l in pr.get("labels") or []]
+    labels = [lb.get("name") for lb in pr.get("labels") or []]
     if "automated" in labels or (pr.get("headRefName") or "").startswith("auto/"):
         return "loop"
     return "other"
@@ -1396,7 +1396,7 @@ def _decide(r, s):
     the base re-check before a real merge -- so main() can file the PR as
     unread rather than decided.
     """
-    repo, num, title, pr = r.repo, r.num, r.title, r.pr
+    repo, num, pr = r.repo, r.num, r.pr
 
     if not r.mergeable:
         why = r.why

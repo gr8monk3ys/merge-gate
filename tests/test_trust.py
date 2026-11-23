@@ -349,7 +349,7 @@ def test_a_declared_correctness_check_beats_both_lists():
 def test_the_predicate_matches_the_control_planes():
     """Same lists as _fleet.is_correctness_check, checked when the control
     plane is importable beside this checkout; skipped standalone."""
-    import importlib.util, os
+    import os
     path = os.path.expanduser("~/code/_orchestrator-automation/scripts/_fleet.py")
     if not os.path.exists(path):
         pytest.skip("control plane not present")
@@ -435,7 +435,7 @@ def test_a_sweep_can_be_asked_not_to_record(monkeypatch):
 
 import datetime as _dt  # noqa: E402
 
-_NOW = _dt.datetime(2026, 11, 15, 12, 0, tzinfo=_dt.timezone.utc)
+_NOW = _dt.datetime.now(_dt.timezone.utc)
 
 
 def _merged_row(repo="o/r", pr=1, hours_ago=1, sha="a" * 40, head="b" * 40,

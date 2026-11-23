@@ -495,7 +495,7 @@ def auto_mergeable(shape, paths):
 
 def ci_fix_allowed(diff_text):
     """A ci-fix-candidate only becomes ci-fix if its diff matches the whitelist."""
-    added = [l for l in diff_text.splitlines() if l.startswith("+") and not l.startswith("+++")]
+    added = [ln for ln in diff_text.splitlines() if ln.startswith("+") and not ln.startswith("+++")]
     if not added:
         return False
     return all(
@@ -1040,7 +1040,7 @@ def all_repos():
                 return _repos_yml_fallback()
             raise RuntimeError(
                 f"cannot enumerate repos for {owner}: {stderr.strip()}")
-        found = [l.strip() for l in r.stdout.splitlines() if l.strip()]
+        found = [ln.strip() for ln in r.stdout.splitlines() if ln.strip()]
         if not found:
             raise RuntimeError(
                 f"{owner} returned zero non-archived repos — refusing to run "
@@ -1265,7 +1265,7 @@ def changed_paths(repo, number):
          "--paginate", "--jq", ".[].filename"])
     if r.returncode != 0:
         return None
-    return [l.strip() for l in r.stdout.splitlines() if l.strip()]
+    return [ln.strip() for ln in r.stdout.splitlines() if ln.strip()]
 
 
 # Live fixtures: (owner/repo, PR number, expected promoted shape). These run
@@ -1465,7 +1465,7 @@ def main():
             "repo": repo, "number": pr["number"], "title": pr["title"],
             "shape": shape, "files": -1 if paths is None else len(paths),
             "bump": bump_kind(pr.get("title", ""), pr.get("body", "")),
-            "labels": [l["name"] for l in pr.get("labels", [])],
+            "labels": [lb["name"] for lb in pr.get("labels", [])],
             "createdAt": pr["createdAt"],
             "auto_mergeable": auto_mergeable(shape, paths),
             "content_veto": content_veto(paths),
