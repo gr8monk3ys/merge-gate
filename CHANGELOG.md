@@ -3,6 +3,20 @@
 Releases before 0.9.0 are described by their commit and PR messages;
 `DECISIONS.md` tells why each rule exists.
 
+## 0.13.0 — a reader for the shaped PRs too
+
+### Added
+
+- **`require_diff_review`.** In a repo that sets it, a PR merging on its
+  allowlisted shape also needs a `merge-gate/diff-review` commit status of
+  `success` on the exact head the gate judges; otherwise it routes and the
+  report says which state it read. Its own context: it never satisfies the
+  reviewed path, and a PR on the reviewed path does not owe it. Read only
+  once the checks are green; an unreadable status raises. The ledger row
+  gains `diff_review`. It may be set once under the registry's top-level
+  `defaults:`, the only gate field that can be, with a repo's own value
+  winning.
+
 ## 0.12.1 — the CI-edit rule reads the range it merges
 
 ### Security

@@ -742,7 +742,12 @@ def parse_repos_yml(path=None):
     except ImportError:
         raise SystemExit("repos.yml needs PyYAML to parse: pip install pyyaml")
     with open(path) as f:
-        repos = (yaml.safe_load(f) or {}).get("repos") or {}
+        doc = yaml.safe_load(f) or {}
+    repos = doc.get("repos") or {}
+    # The one gate field a fleet may set once for every repo: it only ever
+    # adds a condition, so a default cannot loosen anything. A repo's own
+    # value wins, `false` included.
+    defaults = doc.get("defaults") if isinstance(doc.get("defaults"), dict) else {}
     out = {}
     for key, body in repos.items():
         body = body or {}
@@ -773,6 +778,8 @@ def parse_repos_yml(path=None):
             "gate_required_checks": list(body.get("gate_required_checks") or []),
             "allow_reviewed": body.get("allow_reviewed") is True,
             "allow_reviewed_content": body.get("allow_reviewed_content") is True,
+            "require_diff_review": body.get(
+                "require_diff_review", defaults.get("require_diff_review")) is True,
             # The one workflow whose runs may supply a verify-report, by path
             # (".github/workflows/ci.yml"). Absent: no evidence, ever.
             "verify_workflow": (body.get("verify_workflow")
@@ -800,7 +807,8 @@ GATE_CONFIG_FIELDS = ("may_skip", "correctness_checks", "merge_gate_max_per_day"
                       "merge_gate_paused", "merge_gate_ack_reverts",
                       "allow_tests_only", "require_verify_evidence",
                       "verify_workflow", "allow_reviewed",
-                      "allow_reviewed_content", "gate_required_checks")
+                      "allow_reviewed_content", "gate_required_checks",
+                      "require_diff_review")
 
 
 def load_gate_config():
@@ -841,6 +849,12 @@ def load_gate_config():
                               rule still applies. Absent: it routes to a human.
       allow_reviewed_content  true: the same for a PR the content veto stops.
                               Only read where allow_reviewed is also true.
+      require_diff_review     true: a PR merging on its allowlisted shape also
+                              needs a `merge-gate/diff-review` commit status of
+                              `success` on the exact head. Never satisfies the
+                              reviewed path. May also be set once under the
+                              registry's top-level `defaults:`; a repo's own
+                              value wins. Absent: the shape is enough.
       merge_gate_ack_reverts  revert commit SHAs a human has looked at. A
                               pause raised by a detected revert clears only
                               when its SHA is listed here.
