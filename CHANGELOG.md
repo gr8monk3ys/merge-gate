@@ -3,7 +3,7 @@
 Releases before 0.9.0 are described by their commit and PR messages;
 `DECISIONS.md` tells why each rule exists.
 
-## Unreleased — a cap on auto-fix
+## 0.14.0 — a cap on auto-fix
 
 ### Added
 
