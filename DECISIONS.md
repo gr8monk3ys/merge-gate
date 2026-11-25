@@ -783,3 +783,19 @@ name the check-runs instead. GitHub does not enforce them; the gate grades
 them at the head exactly as it grades GitHub's own list, and the gate is the
 only thing that merges. A name that never reports is `missing` and blocks,
 so a wrong declaration fails closed.
+
+### 43. A shape is a claim about paths; someone can still read the diff (0.13.0).
+
+From 0.11.0 the owner's reviewer read every PR off the allowlist, and nothing
+read the ones on it: a lockfile, a patch bump, a new test file merged on
+paths and version numbers alone. The owner asked that a reviewer read those
+too (2026-11-24). `require_diff_review` makes that a condition a repo can
+set. It is a second status context, not `merge-gate/review`, because what
+stands behind it is a look at the diff, not a run of the change: if the two
+shared a context, a cheap pass on a lockfile could one day satisfy the
+reviewed path for a PR whose shape changed under a config edit. Because it
+only adds a condition, a reviewer that is wrong in the permissive direction
+leaves the gate exactly where 0.12 left it. For the same reason it is the
+one gate field the registry's `defaults:` may set for every repo at once:
+a default that can only add a condition cannot open anything by accident.
+

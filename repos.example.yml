@@ -34,6 +34,9 @@ repos:
     allow_reviewed: false
     # The same for a PR the content veto stops. Needs allow_reviewed too.
     allow_reviewed_content: false
+    # A PR merging on its allowlisted shape also needs a `merge-gate/diff-review`
+    # commit status of `success` on its head. It never satisfies allow_reviewed.
+    require_diff_review: false
     # Check-run names the gate requires where GitHub reports no required
     # checks (a private repo on a free plan cannot have branch protection).
     gate_required_checks: []
