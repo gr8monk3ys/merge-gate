@@ -157,7 +157,7 @@ def test_gate_config_is_read_from_repos_yml(tmp_path, monkeypatch):
     pytest.importorskip("yaml")
     y = tmp_path / "repos.yml"
     y.write_text("repos:\n"
-                 "  a: { may_skip: [test], merge_gate_max_per_day: 1,\n"
+                 "  a: { may_skip: [test], merge_gate_max_per_day: 1, max_fix_attempts: 2,\n"
                  "       verify_workflow: .github/workflows/ci.yml }\n"
                  "  b: { merge_gate_paused: true, merge_gate_ack_reverts: [abc1234] }\n"
                  "  c: {}\n")
@@ -165,12 +165,13 @@ def test_gate_config_is_read_from_repos_yml(tmp_path, monkeypatch):
     cfg = cp.load_gate_config()
     assert cfg["a"]["may_skip"] == ["test"]
     assert cfg["a"]["merge_gate_max_per_day"] == 1
+    assert cfg["a"]["max_fix_attempts"] == 2
     assert cfg["a"]["verify_workflow"] == ".github/workflows/ci.yml"
     assert cfg["b"]["merge_gate_paused"] is True
     assert cfg["b"]["merge_gate_ack_reverts"] == ["abc1234"]
     # Absent is the strict value, never a permissive one.
     assert cfg["c"] == {"may_skip": [], "correctness_checks": [],
-                        "merge_gate_max_per_day": None,
+                        "merge_gate_max_per_day": None, "max_fix_attempts": None,
                         "merge_gate_paused": False, "merge_gate_ack_reverts": [],
                         "allow_tests_only": False, "require_verify_evidence": False,
                         "verify_workflow": None,

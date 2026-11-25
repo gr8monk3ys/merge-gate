@@ -279,6 +279,7 @@ finding)*.
 | `GATE_REPOS_YML` | `./repos.yml` | Path to the optional `repos.yml`. Absolute is safest — installed as a package there is no "next to the source file". |
 | `MERGE_GATE_LEDGER` | `~/.local/state/fleet/merge-gate-ledger.jsonl` | The merge ledger. `off` disables it (report-only runs only). |
 | `MERGE_GATE_MAX_PER_DAY` | `3` | Real gate merges per repo per rolling 24h; `repos.yml` `merge_gate_max_per_day` overrides per repo. |
+| `MERGE_GATE_MAX_FIX_ATTEMPTS` | `3` | Distinct red heads a PR may reach before its verdict says `FIX CAP` and the auto-fixers leave it to a human; `repos.yml` `max_fix_attempts` overrides per repo. |
 | `GH_TRANSPORT` | `auto` | `gh` forces the binary, `rest` forces the REST API. `auto` uses the binary only when it can actually authenticate. |
 
 ### Exit status
