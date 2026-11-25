@@ -99,12 +99,21 @@ STALE_BASE = "STALE BASE"
 # not "deliberately ungated" -- it is a Phase 1 setting that no longer
 # matches the repo, and it needs a person to fix the setting or the gate.
 DRIFT = "DRIFT"
+RED_CHECKS = "required check(s) red"
 # Prefix of every circuit-breaker hold. A held PR is green and allowlisted;
 # something about the REPO says not now (see breaker_reason).
 HELD = "HELD"
 # Gate merges allowed per repo per rolling 24h, unless MERGE_GATE_MAX_PER_DAY
 # or the repo's merge_gate_max_per_day says otherwise.
 DEFAULT_MAX_PER_DAY = 3
+
+# Prefix of a red verdict once the PR's required checks have been red on
+# max_fix_attempts distinct heads. Each new red head is a fix that did not
+# work; past the cap the auto-fixers (pr-shepherd, ci-repair) stop pushing
+# and the PR is a human's. Still ROUTED, never merged: the cap relabels a
+# red verdict and changes nothing about a green one.
+FIX_CAP = "FIX CAP"
+DEFAULT_MAX_FIX_ATTEMPTS = 3
 # How far back revert detection looks for gate merges to protect.
 REVERT_LOOKBACK_DAYS = 14
 # Base-branch conclusions that mean "main is broken". `cancelled` is not one:
@@ -586,7 +595,7 @@ def judge(st, moved=frozenset()):
     if st.missing:
         return False, f"required check(s) not run: {', '.join(st.missing)}"
     if st.failed:
-        return False, f"required check(s) red: {', '.join(st.failed)}"
+        return False, f"{RED_CHECKS}: {', '.join(st.failed)}"
     if st.skipped:
         return False, ("required check(s) skipped, and not in this repo's "
                        f"may_skip: {', '.join(st.skipped)}")
@@ -911,6 +920,38 @@ def max_per_day(cfg):
         except (TypeError, ValueError):
             return DEFAULT_MAX_PER_DAY
     return DEFAULT_MAX_PER_DAY
+
+
+def max_fix_attempts(cfg):
+    """Red heads a PR may reach before FIX CAP: repos.yml, else env, else 3.
+    An unreadable value falls back to the default, never to "unlimited"."""
+    for raw in ((cfg or {}).get("max_fix_attempts"),
+                os.environ.get("MERGE_GATE_MAX_FIX_ATTEMPTS", "").strip() or None):
+        if raw is None:
+            continue
+        try:
+            return max(1, int(raw))
+        except (TypeError, ValueError):
+            return DEFAULT_MAX_FIX_ATTEMPTS
+    return DEFAULT_MAX_FIX_ATTEMPTS
+
+
+def fix_cap_reason(st, s, detail):
+    """`detail` with the FIX CAP prefix when this PR has been red on at
+    least max_fix_attempts distinct heads (this one included), else as is."""
+    if not detail.startswith(RED_CHECKS):
+        return detail
+    heads = {st.sha}
+    for row in s.rows():
+        if (row.get("event", "verdict") == "verdict" and row.get("repo") == st.repo
+                and row.get("pr") == st.number and row.get("head_sha")
+                and RED_CHECKS in (row.get("reason") or "")):
+            heads.add(row["head_sha"])
+    cap = max_fix_attempts(st.cfg)
+    if len(heads) < cap:
+        return detail
+    return (f"{FIX_CAP} — required checks red on {len(heads)} heads (cap {cap}); "
+            f"auto-fix stops here, a human decides: {detail}")
 
 
 def _sha_match(a, b):
@@ -1510,7 +1551,7 @@ def _decide(r, s):
         if detail.startswith(STALE_BASE) and kick:
             _file(s, "stale", r, detail, ledger.STALE)
         else:
-            _file(s, "review", r, detail, ledger.ROUTED)
+            _file(s, "review", r, fix_cap_reason(st, s, detail), ledger.ROUTED)
         return
 
     if not DRY_RUN:

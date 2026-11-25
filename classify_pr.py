@@ -769,6 +769,7 @@ def parse_repos_yml(path=None):
             "may_skip": list(body.get("may_skip") or []),
             "correctness_checks": list(body.get("correctness_checks") or []),
             "merge_gate_max_per_day": body.get("merge_gate_max_per_day"),
+            "max_fix_attempts": body.get("max_fix_attempts"),
             "merge_gate_paused": bool(body.get("merge_gate_paused", False)),
             "merge_gate_ack_reverts": [str(s) for s in
                                        body.get("merge_gate_ack_reverts") or []],
@@ -804,6 +805,7 @@ def load_data_dirs():
 
 
 GATE_CONFIG_FIELDS = ("may_skip", "correctness_checks", "merge_gate_max_per_day",
+                      "max_fix_attempts",
                       "merge_gate_paused", "merge_gate_ack_reverts",
                       "allow_tests_only", "require_verify_evidence",
                       "verify_workflow", "allow_reviewed",
@@ -822,6 +824,10 @@ def load_gate_config():
                               field the control plane's is_correctness_check
                               reads.
       merge_gate_max_per_day  overrides MERGE_GATE_MAX_PER_DAY for this repo.
+      max_fix_attempts        overrides MERGE_GATE_MAX_FIX_ATTEMPTS: how many
+                              distinct heads of one PR may have red required
+                              checks before its verdict says FIX CAP and the
+                              auto-fixers leave it to a human.
       merge_gate_paused       true: hold every gate merge in this repo.
       allow_tests_only        true: tests-only PRs may auto-merge (still only
                               brand-new test modules). Absent: they route to

@@ -3,6 +3,20 @@
 Releases before 0.9.0 are described by their commit and PR messages;
 `DECISIONS.md` tells why each rule exists.
 
+## Unreleased — a cap on auto-fix
+
+### Added
+
+- **`FIX CAP`.** A PR whose required checks have been red on
+  `max_fix_attempts` distinct heads (default **3**; `repos.yml`
+  `max_fix_attempts`, else `MERGE_GATE_MAX_FIX_ATTEMPTS`) is still routed,
+  but its reason now starts `FIX CAP — required checks red on N heads (cap
+  M)`. Each new red head is a fix that did not work, counted from the heads
+  the ledger already records. The auto-fixers read that prefix and stop
+  pushing; the PR is a human's. Only a red verdict is relabelled: a green
+  head is judged exactly as before. An unreadable cap falls back to the
+  default, never to unlimited.
+
 ## 0.13.0 — a reader for the shaped PRs too
 
 ### Added
