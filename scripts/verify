@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Gate that Claude Code runs before a session can finish: `make check` (CI's
+# test job): Ruff, pytest, `classify_pr.py --validate`. No network or `gh`.
+# CI also runs a longer Hypothesis fuzz job (`--hypothesis-profile=release`).
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+uv sync --frozen --extra dev
+uv run ruff check .
+uv run pytest -q
+uv run python classify_pr.py --validate
