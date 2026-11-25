@@ -89,6 +89,9 @@ A GitHub account (user or org) the Fleet spans, set by `GATE_OWNERS`.
 `repos.yml`, the operator's per-repo configuration (opt-ins, `may_skip`, caps, pauses).
 _Avoid_: config
 
+**Diff review**:
+An extra condition a repo may set (`require_diff_review`): a PR merging on its Shape also needs a `merge-gate/diff-review` commit status of `success` on its judged head. Never stands in for the Reviewed path.
+
 **Reviewed path**:
 The second way to merge: a PR whose Shape is off the Allowlist merges in an opted-in repo when a `merge-gate/review` commit status is `success` on its judged head.
 

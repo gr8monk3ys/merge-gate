@@ -238,10 +238,14 @@ def required_checks(repo, branch):
 
 
 REVIEW_CONTEXT = "merge-gate/review"
+# The diff review a repo may require on top of an allowlisted shape
+# (`require_diff_review`). Its own context, never REVIEW_CONTEXT: a pass on a
+# diff alone must not be able to stand in for the reviewed path's review.
+DIFF_REVIEW_CONTEXT = "merge-gate/diff-review"
 
 
-def review_state(repo, sha):
-    """The newest `merge-gate/review` commit status on exactly `sha`:
+def review_state(repo, sha, context=REVIEW_CONTEXT):
+    """The newest `context` commit status on exactly `sha`:
     success | failure | error | pending, or None when none was posted.
 
     GitHub lists a commit's statuses newest first, so a later failure
@@ -250,7 +254,7 @@ def review_state(repo, sha):
     """
     out = sh_strict(
         "api", f"repos/{repo}/commits/{sha}/statuses?per_page=100", "--jq",
-        f'[.[] | select(.context == "{REVIEW_CONTEXT}")][0].state // ""')
+        f'[.[] | select(.context == "{context}")][0].state // ""')
     if out is None:
         raise ReadFailed(f"{repo}@{sha[:8]}: commit not found")
     return out.strip() or None
@@ -735,6 +739,10 @@ class Reading:
         self.review_required = False
         self.edits_ci = False              # see _read: declared checks only
         self.review: str | None = None     # the status state read, if any
+        # require_diff_review: a PR merging on its shape also needs a passing
+        # DIFF_REVIEW_CONTEXT status on its head.
+        self.diff_review_required = False
+        self.diff_review: str | None = None
 
 
 def _read(pr, repo, num, data_dirs, cache=None, stop=None):
@@ -850,6 +858,18 @@ def _read(pr, repo, num, data_dirs, cache=None, stop=None):
         if r.state.branch_head is not None:
             bail_if(stop)
             r.review = review_state(repo, r.state.sha)
+
+    # The diff review. A repo may ask that a PR merging on its shape alone
+    # (the allowlist, not the reviewed path above) also carry a passing
+    # diff review of its head: a second reader on what the shape rules
+    # already accept. It only ever adds a condition. Read for the head
+    # read_state() read, and only once the checks are green, like the review.
+    if (r.mergeable and not r.review_required
+            and cfg.get("require_diff_review") is True):
+        r.diff_review_required = True
+        if r.state.branch_head is not None:
+            bail_if(stop)
+            r.diff_review = review_state(repo, r.state.sha, DIFF_REVIEW_CONTEXT)
 
     # Where the required checks are only declared (gate_required_checks),
     # GitHub enforces nothing, so a PR that edits CI could redefine what it is
@@ -1348,6 +1368,8 @@ def ledger_row(r, decision, reason, merge_commit_sha=None):
         "green_by_skip": bool(st.green_by_skip) if st else False,
         # The review status read at head_sha, on the reviewed path only.
         "review": getattr(r, "review", None),
+        # The diff-review status read at head_sha, where the repo requires one.
+        "diff_review": getattr(r, "diff_review", None),
         "artifacts": artifacts,
         "decision": decision, "reason": reason,
         "dry_run": DRY_RUN,
@@ -1440,6 +1462,12 @@ def _decide(r, s):
         _file(s, "review", r,
               f"{r.why}; green, but {REVIEW_CONTEXT} is "
               f"{r.review or 'not posted'} at {sha[:8]}", ledger.ROUTED)
+        return
+
+    if green and r.diff_review_required and r.diff_review != "success":
+        _file(s, "review", r,
+              f"{r.shape}; green, but {DIFF_REVIEW_CONTEXT} is "
+              f"{r.diff_review or 'not posted'} at {sha[:8]}", ledger.ROUTED)
         return
 
     if green and r.evidence_why:

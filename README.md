@@ -93,6 +93,24 @@ checks: it could redefine them. That is read from the compare of the exact
 range merged, renames included. The ledger row carries `review` (the state read) and its reason
 reads `mixed (reviewed); green: …`.
 
+## The diff review
+
+The allowlist answers "is this diff safe by its shape", and nobody reads a
+shaped PR before it merges. A repo may ask for one reader anyway:
+`require_diff_review: true` in `repos.yml`, per repo or once under the
+top-level `defaults:` (the only gate field a default can set, since it only
+adds a condition; a repo's own `false` wins). Then a PR merging **on its
+shape** also needs the newest `merge-gate/diff-review` commit status on the
+judged head to be `success`. Missing, `pending`, `failure` or `error` routes
+it with that reason (`lockfile-only; green, but merge-gate/diff-review is not
+posted at 1a2b3c4d`); an unreadable status is no verdict, never a pass.
+
+It only adds a condition: every shape rule, check, base rule and breaker
+still applies, and a red PR's status is never read. It has its own context on
+purpose. A diff review is a lighter look than a review, so it can never stand
+in for `merge-gate/review`, and a PR on the reviewed path does not owe it.
+The ledger row carries `diff_review` (the state read).
+
 The gate does not review; it reads a verdict. Who posts the status, and how
 hard they looked, is the operator's to arrange. Anyone with push access can
 post one, the PR's own author included, so this is a separation of runs, not
